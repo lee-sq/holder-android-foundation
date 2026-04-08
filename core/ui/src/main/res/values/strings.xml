@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="toast_success_default_text">操作成功</string>
+    <string name="toast_error_default_text">操作失败</string>
+    <string name="toast_error_warning_text">警告</string>
+    <string name="toast_error_info_text">文本</string>
+    <string name="permission_agreement_tips">需要您同意以下权限才能正常使用</string>
+    <string name="permission_agree">同意</string>
+    <string name="permission_cancel">取消</string>
+    <string name="permission_notify_go_system_setting">您需要去应用程序设置当中手动开启权限</string>
+    <string name="permission_go_setting">去设置</string>
+</resources>

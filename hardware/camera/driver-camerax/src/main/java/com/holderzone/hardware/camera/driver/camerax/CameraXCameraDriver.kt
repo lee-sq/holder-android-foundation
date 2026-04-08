@@ -1,0 +1,618 @@
+package com.holderzone.hardware.camera.driver.camerax
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.os.Handler
+import android.os.Looper
+import android.view.View
+import android.view.ViewTreeObserver
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import com.google.common.util.concurrent.ListenableFuture
+import com.holderzone.hardware.camera.CameraBackend
+import com.holderzone.hardware.camera.CameraCapability
+import com.holderzone.hardware.camera.CameraConfig
+import com.holderzone.hardware.camera.CameraEvent
+import com.holderzone.hardware.camera.CameraException
+import com.holderzone.hardware.camera.CameraFrame
+import com.holderzone.hardware.camera.CaptureKind
+import com.holderzone.hardware.camera.CaptureRequest
+import com.holderzone.hardware.camera.CaptureResult
+import com.holderzone.hardware.camera.FrameDeliveryConfig
+import com.holderzone.hardware.camera.LensFacing
+import com.holderzone.hardware.camera.PreviewHost
+import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.spi.CameraDriver
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+/**
+ * CameraX driver used as the default built-in camera backend.
+ */
+class CameraXCameraDriver(
+    private val appContext: Context,
+    private val logger: CameraLogger,
+) : CameraDriver {
+
+    override val backend: CameraBackend = CameraBackend.CAMERA_X
+    override val capabilities: CameraCapability = CameraCapability(
+        switchLens = true,
+        stillCapture = true,
+        previewSnapshot = true,
+        frameStreaming = true,
+        uvcSelection = false,
+    )
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val eventFlow = MutableSharedFlow<CameraEvent>(extraBufferCapacity = 16)
+    private val frameFlow = MutableSharedFlow<CameraFrame>(extraBufferCapacity = 1)
+    override val events: Flow<CameraEvent> = eventFlow.asSharedFlow()
+    override val frames: Flow<CameraFrame> = frameFlow.asSharedFlow()
+
+    private val lifecycleOwner = DriverLifecycleOwner()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private var previewHost: PreviewHost? = null
+    private var previewContainerView: View? = null
+    private var previewView: PreviewView? = null
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var preview: Preview? = null
+    private var imageCapture: ImageCapture? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var camera: Camera? = null
+    private var currentConfig: CameraConfig? = null
+    private var currentLensFacing: LensFacing = LensFacing.BACK
+    private var lastFrameAtMs: Long = 0L
+    private var closed = false
+
+    override suspend fun bind(host: PreviewHost, config: CameraConfig) {
+        ensureOpen()
+        currentConfig = config
+        currentLensFacing = config.lensFacing
+        previewHost = host
+        previewContainerView = host as? View
+        val view = PreviewView(host.previewContext).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+        previewView = view
+        host.attachPreview(view)
+    }
+
+    override suspend fun start() {
+        ensureOpen()
+        ensureCameraPermission()
+        val hostView = previewView ?: throw CameraException.PreviewBindingException(
+            "CameraX preview host is not bound."
+        )
+        val config = currentConfig ?: throw CameraException.ConfigurationException(
+            "CameraX config is missing."
+        )
+
+        try {
+            startWithTimeouts(
+                hostView = hostView,
+                config = config,
+                readyTimeoutMillis = 2_500L,
+            )
+        } catch (exception: TimeoutCancellationException) {
+            if (shouldRetryHostReadiness(hostView)) {
+                logger.warn(
+                    "CameraXDriver",
+                    "CameraX start timed out before the preview host was ready. " +
+                        "Retrying once after layout settles."
+                )
+                delay(200L)
+                try {
+                    startWithTimeouts(
+                        hostView = hostView,
+                        config = config,
+                        readyTimeoutMillis = 5_000L,
+                    )
+                    return
+                } catch (retryException: TimeoutException) {
+                    throw CameraException.PreviewBindingException(
+                        "CameraX timed out while creating the preview session. " +
+                            "The preview surface may not be ready yet, or the device camera service " +
+                            "is responding too slowly.",
+                        retryException,
+                    )
+                } catch (retryException: TimeoutCancellationException) {
+                    throw CameraException.PreviewBindingException(
+                        "CameraX start timed out while waiting for the preview host or camera provider.",
+                        retryException,
+                    )
+                }
+            }
+            throw CameraException.PreviewBindingException(
+                "CameraX start timed out while waiting for the preview host or camera provider.",
+                exception,
+            )
+        } catch (exception: TimeoutException) {
+            throw CameraException.PreviewBindingException(
+                "CameraX timed out while creating the preview session. " +
+                    "The preview surface may not be ready yet, or the device camera service " +
+                    "is responding too slowly.",
+                exception,
+            )
+        }
+    }
+
+    override suspend fun stop() {
+        cameraProvider?.unbindAll()
+        lifecycleOwner.moveToCreated()
+        preview = null
+        imageCapture = null
+        imageAnalysis = null
+        camera = null
+        eventFlow.emit(CameraEvent.PreviewStopped(backend))
+    }
+
+    override suspend fun switchLens(facing: LensFacing) {
+        currentLensFacing = facing
+        if (camera != null) {
+            stop()
+            start()
+        }
+    }
+
+    override suspend fun capture(request: CaptureRequest): CaptureResult {
+        ensureOpen()
+        return when (request) {
+            is CaptureRequest.PreviewSnapshot -> capturePreviewSnapshot(request)
+            is CaptureRequest.PreferStill,
+            is CaptureRequest.RequireStill,
+            -> captureStill(request)
+        }
+    }
+
+    override fun close() {
+        if (closed) {
+            return
+        }
+        closed = true
+
+        val cleanup = {
+            previewHost?.let { host ->
+                previewView?.let(host::detachPreview)
+            }
+            previewHost = null
+            previewContainerView = null
+            previewView = null
+            cameraProvider?.unbindAll()
+            preview = null
+            imageCapture = null
+            imageAnalysis = null
+            camera = null
+            lifecycleOwner.destroy()
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            cleanup()
+        } else {
+            val latch = CountDownLatch(1)
+            mainHandler.post {
+                try {
+                    cleanup()
+                } finally {
+                    latch.countDown()
+                }
+            }
+            latch.await(5, TimeUnit.SECONDS)
+        }
+
+        cameraExecutor.shutdownNow()
+        scope.cancel()
+    }
+
+    private suspend fun captureStill(request: CaptureRequest): CaptureResult {
+        val capture = imageCapture ?: throw CameraException.CaptureFailureException(
+            "CameraX still capture is not ready."
+        )
+        val file = resolveOutputFile(
+            requestedFile = request.outputFile,
+            prefix = "camerax_still",
+        )
+        return suspendCancellableCoroutine { continuation ->
+            val output = ImageCapture.OutputFileOptions.Builder(file).build()
+            capture.takePicture(
+                output,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onError(exception: ImageCaptureException) {
+                        continuation.resumeWithException(
+                            CameraException.CaptureFailureException(
+                                "CameraX still capture failed.",
+                                exception,
+                            )
+                        )
+                    }
+
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        continuation.resume(
+                            CaptureResult(
+                                path = file.absolutePath,
+                                kind = CaptureKind.STILL,
+                                backend = backend,
+                            )
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    private suspend fun capturePreviewSnapshot(request: CaptureRequest): CaptureResult {
+        val bitmap = previewView?.bitmap ?: throw CameraException.CaptureFailureException(
+            "CameraX preview bitmap is not ready."
+        )
+        val file = resolveOutputFile(
+            requestedFile = request.outputFile,
+            prefix = "camerax_snapshot",
+        )
+        saveBitmap(bitmap, file)
+        return CaptureResult(
+            path = file.absolutePath,
+            kind = CaptureKind.SNAPSHOT,
+            backend = backend,
+        )
+    }
+
+    private fun handleAnalysisFrame(
+        imageProxy: ImageProxy,
+        frameConfig: FrameDeliveryConfig,
+    ) {
+        try {
+            val now = System.currentTimeMillis()
+            if (now - lastFrameAtMs < frameConfig.minIntervalMillis) {
+                return
+            }
+            lastFrameAtMs = now
+            val frame = CameraFrame(
+                nv21 = imageProxy.toNv21(),
+                width = imageProxy.width,
+                height = imageProxy.height,
+                rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+            )
+            scope.launch {
+                frameFlow.emit(frame)
+            }
+        } catch (throwable: Throwable) {
+            scope.launch {
+                eventFlow.emit(
+                    CameraEvent.Error(
+                        CameraException.CaptureFailureException(
+                            "CameraX frame analysis failed.",
+                            throwable,
+                        )
+                    )
+                )
+            }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun selectCameraSelector(
+        provider: ProcessCameraProvider,
+        facing: LensFacing,
+    ): CameraSelector {
+        val primary = when (facing) {
+            LensFacing.FRONT -> CameraSelector.DEFAULT_FRONT_CAMERA
+            LensFacing.BACK -> CameraSelector.DEFAULT_BACK_CAMERA
+            LensFacing.EXTERNAL -> CameraSelector.DEFAULT_BACK_CAMERA
+        }
+        val secondary = if (primary == CameraSelector.DEFAULT_FRONT_CAMERA) {
+            CameraSelector.DEFAULT_BACK_CAMERA
+        } else {
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        }
+        return when {
+            provider.hasCamera(primary) -> primary
+            provider.hasCamera(secondary) -> secondary
+            else -> throw CameraException.DeviceUnavailableException("No CameraX camera is available.")
+        }
+    }
+
+    private fun ensureCameraPermission() {
+        if (ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.CAMERA
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            throw CameraException.PermissionDeniedException()
+        }
+    }
+
+    private fun ensureOpen() {
+        if (closed) {
+            throw CameraException.ClosedException()
+        }
+    }
+
+    private suspend fun startWithTimeouts(
+        hostView: PreviewView,
+        config: CameraConfig,
+        readyTimeoutMillis: Long,
+    ) {
+        previewContainerView?.awaitReady(
+            timeoutMillis = readyTimeoutMillis,
+            label = "preview container",
+        )
+        previewHost?.attachPreview(hostView)
+        hostView.awaitReady(
+            timeoutMillis = readyTimeoutMillis,
+            label = "preview view",
+        )
+        lifecycleOwner.moveToStarted()
+
+        val provider = cameraProvider ?: withTimeout(8_000L) {
+            ProcessCameraProvider.getInstance(appContext).await()
+        }.also {
+            cameraProvider = it
+        }
+        val selector = selectCameraSelector(provider, currentLensFacing)
+        val shouldAnalyze = config.frameDeliveryConfig.enabled
+
+        preview = Preview.Builder().build().also {
+            it.surfaceProvider = hostView.surfaceProvider
+        }
+        imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .build()
+        imageAnalysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .build()
+            .also { analysis ->
+                if (shouldAnalyze) {
+                    analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                        handleAnalysisFrame(imageProxy, config.frameDeliveryConfig)
+                    }
+                } else {
+                    analysis.clearAnalyzer()
+                }
+            }
+
+        provider.unbindAll()
+        camera = provider.bindToLifecycle(
+            lifecycleOwner,
+            selector,
+            preview,
+            imageCapture,
+            imageAnalysis,
+        )
+        eventFlow.emit(CameraEvent.PreviewStarted(backend))
+    }
+
+    private fun shouldRetryHostReadiness(hostView: PreviewView): Boolean {
+        val containerReady = previewContainerView?.isReadyForCameraBinding() != false
+        val previewReady = hostView.isReadyForCameraBinding()
+        return !containerReady || !previewReady
+    }
+
+    /**
+     * CameraX is sensitive to preview hosts that are created but not yet attached or measured.
+     * Waiting for a real surface container greatly reduces startup timeouts on slower devices.
+     */
+    private suspend fun View.awaitReady(
+        timeoutMillis: Long,
+        label: String,
+    ) {
+        if (isReadyForCameraBinding()) {
+            return
+        }
+
+        try {
+            withTimeout(timeoutMillis) {
+                suspendCancellableCoroutine<Unit> { continuation ->
+                    lateinit var attachListener: View.OnAttachStateChangeListener
+                    lateinit var layoutListener: View.OnLayoutChangeListener
+                    lateinit var preDrawListener: ViewTreeObserver.OnPreDrawListener
+
+                    fun cleanup() {
+                        removeOnAttachStateChangeListener(attachListener)
+                        removeOnLayoutChangeListener(layoutListener)
+                        if (viewTreeObserver.isAlive) {
+                            viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+                        }
+                    }
+
+                    fun resumeIfReady() {
+                        if (!continuation.isActive) {
+                            return
+                        }
+                        if (isReadyForCameraBinding()) {
+                            cleanup()
+                            continuation.resume(Unit)
+                        }
+                    }
+
+                    attachListener = object : View.OnAttachStateChangeListener {
+                        override fun onViewAttachedToWindow(v: View) {
+                            resumeIfReady()
+                        }
+
+                        override fun onViewDetachedFromWindow(v: View) = Unit
+                    }
+                    layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                        resumeIfReady()
+                    }
+                    preDrawListener = object : ViewTreeObserver.OnPreDrawListener {
+                        override fun onPreDraw(): Boolean {
+                            resumeIfReady()
+                            return true
+                        }
+                    }
+
+                    addOnAttachStateChangeListener(attachListener)
+                    addOnLayoutChangeListener(layoutListener)
+                    if (viewTreeObserver.isAlive) {
+                        viewTreeObserver.addOnPreDrawListener(preDrawListener)
+                    }
+
+                    post { resumeIfReady() }
+                    continuation.invokeOnCancellation { cleanup() }
+                }
+            }
+        } catch (exception: TimeoutCancellationException) {
+            logger.warn(
+                "CameraXDriver",
+                "Timed out waiting for $label to become ready. attached=$isAttachedToWindow width=$width height=$height"
+            )
+            throw exception
+        }
+    }
+
+    private fun View.isReadyForCameraBinding(): Boolean {
+        return isAttachedToWindow && width > 0 && height > 0
+    }
+
+    private fun resolveOutputFile(
+        requestedFile: File?,
+        prefix: String,
+    ): File {
+        requestedFile?.let { file ->
+            file.parentFile?.mkdirs()
+            return file
+        }
+        return createOutputFile(prefix)
+    }
+
+    private fun createOutputFile(prefix: String): File {
+        val parent = File(appContext.cacheDir, "camera-sdk").apply { mkdirs() }
+        return File(parent, "${prefix}_${System.currentTimeMillis()}.jpg")
+    }
+
+    private fun saveBitmap(bitmap: Bitmap, file: File) {
+        file.parentFile?.mkdirs()
+        FileOutputStream(file).use { output ->
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
+                throw CameraException.CaptureFailureException("Failed to compress CameraX preview bitmap.")
+            }
+        }
+    }
+
+    private suspend fun <T> ListenableFuture<T>.await(): T {
+        return suspendCancellableCoroutine { continuation ->
+            addListener(
+                {
+                    try {
+                        continuation.resume(get())
+                    } catch (throwable: Throwable) {
+                        continuation.resumeWithException(throwable)
+                    }
+                },
+                ContextCompat.getMainExecutor(appContext),
+            )
+        }
+    }
+}
+
+private class DriverLifecycleOwner : LifecycleOwner {
+    private val lifecycleRegistry = LifecycleRegistry(this)
+
+    init {
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+    }
+
+    override val lifecycle: Lifecycle
+        get() = lifecycleRegistry
+
+    fun moveToStarted() {
+        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+    }
+
+    fun moveToCreated() {
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+    }
+
+    fun destroy() {
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+    }
+}
+
+private fun ImageProxy.toNv21(): ByteArray {
+    val width = width
+    val height = height
+    val yPlane = planes[0]
+    val uPlane = planes[1]
+    val vPlane = planes[2]
+
+    val output = ByteArray(width * height * 3 / 2)
+    val yBuffer = yPlane.buffer
+    val uBuffer = uPlane.buffer
+    val vBuffer = vPlane.buffer
+
+    val yBytes = ByteArray(yBuffer.remaining())
+    yBuffer.get(yBytes)
+    var offset = 0
+    if (yPlane.pixelStride == 1 && yPlane.rowStride == width) {
+        System.arraycopy(yBytes, 0, output, 0, yBytes.size)
+        offset = yBytes.size
+    } else {
+        for (row in 0 until height) {
+            var index = row * yPlane.rowStride
+            repeat(width) {
+                output[offset++] = yBytes[index]
+                index += yPlane.pixelStride
+            }
+        }
+    }
+
+    val uBytes = ByteArray(uBuffer.remaining())
+    val vBytes = ByteArray(vBuffer.remaining())
+    uBuffer.get(uBytes)
+    vBuffer.get(vBytes)
+    val chromaHeight = height / 2
+    val chromaWidth = width / 2
+    for (row in 0 until chromaHeight) {
+        var uIndex = row * uPlane.rowStride
+        var vIndex = row * vPlane.rowStride
+        repeat(chromaWidth) {
+            output[offset++] = vBytes[vIndex]
+            output[offset++] = uBytes[uIndex]
+            uIndex += uPlane.pixelStride
+            vIndex += vPlane.pixelStride
+        }
+    }
+    return output
+}

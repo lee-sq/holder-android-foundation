@@ -1,0 +1,432 @@
+package com.holderzone.hardware.camera.driver.uvc
+
+import android.content.Context
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.SurfaceTexture
+import android.graphics.YuvImage
+import android.hardware.usb.UsbDevice
+import android.view.Surface
+import android.view.TextureView
+import com.holderzone.hardware.camera.CameraBackend
+import com.holderzone.hardware.camera.CameraCapability
+import com.holderzone.hardware.camera.CameraConfig
+import com.holderzone.hardware.camera.CameraEvent
+import com.holderzone.hardware.camera.CameraException
+import com.holderzone.hardware.camera.CameraFrame
+import com.holderzone.hardware.camera.CaptureKind
+import com.holderzone.hardware.camera.CaptureRequest
+import com.holderzone.hardware.camera.CaptureResult
+import com.holderzone.hardware.camera.FrameDeliveryConfig
+import com.holderzone.hardware.camera.LensFacing
+import com.holderzone.hardware.camera.PreviewHost
+import com.holderzone.hardware.camera.R
+import com.holderzone.hardware.camera.UsbDeviceSelector
+import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.spi.CameraDriver
+import com.serenegiant.usb.DeviceFilter
+import com.serenegiant.usb.USBMonitor
+import com.serenegiant.usb.UVCCamera
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+
+/**
+ * UVC driver isolated behind the same SDK contract as the built-in backends.
+ */
+class UvcCameraDriver(
+    private val appContext: Context,
+    private val logger: CameraLogger,
+) : CameraDriver {
+
+    override val backend: CameraBackend = CameraBackend.UVC
+    override val capabilities: CameraCapability = CameraCapability(
+        switchLens = false,
+        stillCapture = false,
+        previewSnapshot = true,
+        frameStreaming = true,
+        uvcSelection = true,
+    )
+    override val frames: Flow<CameraFrame>
+        get() = frameFlow.asSharedFlow()
+    override val events: Flow<CameraEvent>
+        get() = eventFlow.asSharedFlow()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val eventFlow = MutableSharedFlow<CameraEvent>(extraBufferCapacity = 16)
+    private val frameFlow = MutableSharedFlow<CameraFrame>(extraBufferCapacity = 1)
+    private val deviceFilters = DeviceFilter.getDeviceFilters(appContext, R.xml.device_filter)
+
+    private var previewHost: PreviewHost? = null
+    private var textureView: TextureView? = null
+    private var surface: Surface? = null
+    private var usbMonitor: USBMonitor? = null
+    private var currentConfig: CameraConfig? = null
+    private var selectedDevice: UsbDevice? = null
+    private var pendingControlBlock: USBMonitor.UsbControlBlock? = null
+    private var openCamera: UVCCamera? = null
+    private var previewWidth: Int = 1280
+    private var previewHeight: Int = 720
+    private var latestFrame: CameraFrame? = null
+    private var captureWaiter: CompletableDeferred<CameraFrame>? = null
+    private var startWaiter: CompletableDeferred<Unit>? = null
+    private var lastFrameAtMs: Long = 0L
+    private var closed = false
+
+    override suspend fun bind(host: PreviewHost, config: CameraConfig) {
+        ensureOpen()
+        currentConfig = config
+        previewHost = host
+        textureView = TextureView(host.previewContext).apply {
+            surfaceTextureListener = PreviewTextureListener()
+        }
+        host.attachPreview(textureView!!)
+        ensureUsbMonitor()
+    }
+
+    override suspend fun start() {
+        ensureOpen()
+        val monitor = ensureUsbMonitor()
+        if (!monitor.isRegistered) {
+            monitor.register()
+        }
+
+        val target = resolveTargetDevice(monitor)
+        selectedDevice = target
+        val waiter = CompletableDeferred<Unit>()
+        startWaiter = waiter
+        if (!monitor.requestPermission(target)) {
+            throw CameraException.DeviceUnavailableException("Failed to request USB permission for UVC camera.")
+        }
+        waiter.await()
+    }
+
+    override suspend fun stop() {
+        releaseCamera()
+        usbMonitor?.takeIf { it.isRegistered }?.unregister()
+        eventFlow.emit(CameraEvent.PreviewStopped(backend))
+    }
+
+    override suspend fun switchLens(facing: LensFacing) {
+        throw CameraException.ConfigurationException("UVC backend does not support lens switching.")
+    }
+
+    override suspend fun capture(request: CaptureRequest): CaptureResult {
+        ensureOpen()
+        if (request is CaptureRequest.RequireStill) {
+            throw CameraException.CaptureFailureException(
+                "UVC backend only supports preview snapshots in SDK v1."
+            )
+        }
+
+        val file = resolveOutputFile(
+            requestedFile = request.outputFile,
+            prefix = "uvc_snapshot",
+        )
+        val frame = latestFrame ?: waitForFrame()
+        saveFrame(frame, file)
+        return CaptureResult(
+            path = file.absolutePath,
+            kind = CaptureKind.SNAPSHOT,
+            backend = backend,
+        )
+    }
+
+    override fun close() {
+        if (closed) {
+            return
+        }
+        closed = true
+        releaseCamera()
+        usbMonitor?.takeIf { it.isRegistered }?.unregister()
+        usbMonitor?.destroy()
+        usbMonitor = null
+        surface?.release()
+        surface = null
+        previewHost?.let { host ->
+            textureView?.let(host::detachPreview)
+        }
+        previewHost = null
+        textureView = null
+        latestFrame = null
+        captureWaiter?.cancel()
+        startWaiter?.cancel()
+        scope.cancel()
+    }
+
+    private fun ensureUsbMonitor(): USBMonitor {
+        usbMonitor?.let { return it }
+        val created = USBMonitor(appContext, DeviceListener()).also {
+            it.setDeviceFilter(deviceFilters)
+        }
+        usbMonitor = created
+        return created
+    }
+
+    private fun resolveTargetDevice(monitor: USBMonitor): UsbDevice {
+        val candidates = monitor.deviceList
+        if (candidates.isEmpty()) {
+            throw CameraException.DeviceUnavailableException("No UVC device matches device_filter.xml.")
+        }
+
+        val selector = currentConfig?.usbDeviceSelector
+        return when (selector) {
+            null -> {
+                if (candidates.size == 1) {
+                    candidates.first()
+                } else {
+                    throw CameraException.DeviceSelectionRequiredException(
+                        "Multiple UVC devices are connected. Provide UsbDeviceSelector.ByVidPid."
+                    )
+                }
+            }
+
+            is UsbDeviceSelector.ByVidPid -> candidates.firstOrNull { device ->
+                device.vendorId == selector.vendorId && device.productId == selector.productId
+            } ?: throw CameraException.DeviceUnavailableException(
+                "No UVC device matches VID=${selector.vendorId} PID=${selector.productId}."
+            )
+        }
+    }
+
+    private suspend fun waitForFrame(): CameraFrame {
+        val waiter = CompletableDeferred<CameraFrame>()
+        captureWaiter = waiter
+        return waiter.await()
+    }
+
+    private fun openCamera(controlBlock: USBMonitor.UsbControlBlock) {
+        releaseCamera()
+        val camera = UVCCamera().apply {
+            open(controlBlock)
+            configurePreviewSize(this)
+            setFrameCallback({ buffer ->
+                handleFrame(buffer, currentConfig?.frameDeliveryConfig ?: FrameDeliveryConfig.DISABLED)
+            }, UVCCamera.PIXEL_FORMAT_YUV420SP)
+        }
+        openCamera = camera
+
+        val currentSurface = surface
+        if (currentSurface != null) {
+            camera.setPreviewDisplay(currentSurface)
+            camera.startPreview()
+            scope.launch {
+                startWaiter?.complete(Unit)
+                startWaiter = null
+                eventFlow.emit(CameraEvent.PreviewStarted(backend))
+            }
+        } else {
+            pendingControlBlock = controlBlock
+        }
+    }
+
+    private fun configurePreviewSize(camera: UVCCamera) {
+        try {
+            camera.setPreviewSize(1280, 720, UVCCamera.FRAME_FORMAT_MJPEG)
+            previewWidth = 1280
+            previewHeight = 720
+        } catch (_: Throwable) {
+            try {
+                camera.setPreviewSize(1280, 720, UVCCamera.FRAME_FORMAT_YUYV)
+                previewWidth = 1280
+                previewHeight = 720
+            } catch (_: Throwable) {
+                camera.setPreviewSize(
+                    UVCCamera.DEFAULT_PREVIEW_WIDTH,
+                    UVCCamera.DEFAULT_PREVIEW_HEIGHT,
+                    UVCCamera.DEFAULT_PREVIEW_MODE,
+                )
+                previewWidth = UVCCamera.DEFAULT_PREVIEW_WIDTH
+                previewHeight = UVCCamera.DEFAULT_PREVIEW_HEIGHT
+            }
+        }
+    }
+
+    private fun handleFrame(
+        buffer: ByteBuffer,
+        frameConfig: FrameDeliveryConfig,
+    ) {
+        try {
+            val length = buffer.capacity()
+            val bytes = ByteArray(length)
+            buffer.rewind()
+            buffer.get(bytes)
+            val nv21 = nv12ToNv21(bytes)
+            val frame = CameraFrame(
+                nv21 = nv21,
+                width = previewWidth,
+                height = previewHeight,
+                rotationDegrees = 0,
+            )
+            latestFrame = frame
+            captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
+            captureWaiter = null
+
+            val now = System.currentTimeMillis()
+            if (frameConfig.enabled && now - lastFrameAtMs >= frameConfig.minIntervalMillis) {
+                lastFrameAtMs = now
+                scope.launch {
+                    frameFlow.emit(frame)
+                }
+            }
+        } catch (throwable: Throwable) {
+            scope.launch {
+                eventFlow.emit(
+                    CameraEvent.Error(
+                        CameraException.CaptureFailureException(
+                            "UVC frame pipeline failed.",
+                            throwable,
+                        )
+                    )
+                )
+            }
+        }
+    }
+
+    private fun releaseCamera() {
+        pendingControlBlock = null
+        openCamera?.let { camera ->
+            runCatching {
+                camera.stopPreview()
+            }
+            runCatching {
+                camera.close()
+            }
+            runCatching {
+                camera.destroy()
+            }
+        }
+        openCamera = null
+    }
+
+    private fun saveFrame(frame: CameraFrame, file: File) {
+        val output = ByteArrayOutputStream()
+        val image = YuvImage(frame.nv21, ImageFormat.NV21, frame.width, frame.height, null)
+        if (!image.compressToJpeg(Rect(0, 0, frame.width, frame.height), 95, output)) {
+            throw CameraException.CaptureFailureException("Failed to encode UVC snapshot from NV21.")
+        }
+        file.parentFile?.mkdirs()
+        FileOutputStream(file).use { stream ->
+            stream.write(output.toByteArray())
+        }
+    }
+
+    private fun createOutputFile(prefix: String): File {
+        val parent = File(appContext.cacheDir, "camera-sdk").apply { mkdirs() }
+        return File(parent, "${prefix}_${System.currentTimeMillis()}.jpg")
+    }
+
+    private fun resolveOutputFile(
+        requestedFile: File?,
+        prefix: String,
+    ): File {
+        requestedFile?.let { file ->
+            file.parentFile?.mkdirs()
+            return file
+        }
+        return createOutputFile(prefix)
+    }
+
+    private fun ensureOpen() {
+        if (closed) {
+            throw CameraException.ClosedException()
+        }
+    }
+
+    private inner class DeviceListener : USBMonitor.OnDeviceConnectListener {
+        override fun onAttach(device: UsbDevice) = Unit
+
+        override fun onDettach(device: UsbDevice) {
+            if (device.deviceId == selectedDevice?.deviceId) {
+                releaseCamera()
+            }
+        }
+
+        override fun onConnect(
+            device: UsbDevice,
+            ctrlBlock: USBMonitor.UsbControlBlock,
+            createNew: Boolean,
+        ) {
+            if (device.deviceId != selectedDevice?.deviceId) {
+                return
+            }
+            if (surface == null) {
+                pendingControlBlock = ctrlBlock
+                return
+            }
+            runCatching {
+                openCamera(ctrlBlock)
+            }.onFailure { throwable ->
+                scope.launch {
+                    startWaiter?.completeExceptionally(
+                        CameraException.DeviceUnavailableException(
+                            "Failed to open the selected UVC device.",
+                            throwable,
+                        )
+                    )
+                    startWaiter = null
+                }
+            }
+        }
+
+        override fun onDisconnect(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock) {
+            if (device.deviceId == selectedDevice?.deviceId) {
+                releaseCamera()
+                scope.launch {
+                    eventFlow.emit(CameraEvent.PreviewStopped(backend))
+                }
+            }
+        }
+
+        override fun onCancel(device: UsbDevice) {
+            if (device.deviceId == selectedDevice?.deviceId) {
+                scope.launch {
+                    startWaiter?.completeExceptionally(CameraException.PermissionDeniedException())
+                    startWaiter = null
+                }
+            }
+        }
+    }
+
+    private inner class PreviewTextureListener : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+            surface = Surface(surfaceTexture)
+            pendingControlBlock?.let { controlBlock ->
+                pendingControlBlock = null
+                openCamera(controlBlock)
+            }
+        }
+
+        override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) = Unit
+
+        override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+            surface?.release()
+            surface = null
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+    }
+}
+
+private fun nv12ToNv21(source: ByteArray): ByteArray {
+    val output = source.copyOf()
+    var index = source.size / 3 * 2
+    while (index + 1 < output.size) {
+        val u = output[index]
+        output[index] = output[index + 1]
+        output[index + 1] = u
+        index += 2
+    }
+    return output
+}

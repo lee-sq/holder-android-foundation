@@ -1,0 +1,21 @@
+-keep class com.jws.** { *; }
+-keep class com.android.jws.** { *; }
+-keep class com.tongdeliu.jwbaselib.** { *; }
+-keep class com.baijie.biajieapilibrary.** { *; }
+-keep class com.bjw.** { *; }
+-dontwarn android.hardware.SerialManager
+-dontwarn android.jws.**
+-dontwarn android.media.AudioSystem
+-dontwarn android.net.EthernetManager
+-dontwarn android.net.IpConfiguration$IpAssignment
+-dontwarn android.net.IpConfiguration$ProxySettings
+-dontwarn android.os.INetworkManagementService
+-dontwarn android.os.INetworkManagementService$Stub
+-dontwarn android.os.ServiceManager
+-dontwarn android.os.SystemProperties
+-dontwarn android.os.storage.DiskInfo
+-dontwarn android.os.storage.VolumeInfo
+-dontwarn android.view.SurfaceControl$DisplayCaptureArgs
+-dontwarn android.view.SurfaceControl$DisplayCaptureArgs$Builder
+-dontwarn android.view.SurfaceControl$ScreenCaptureListener
+-dontwarn android.view.SurfaceControl$ScreenshotHardwareBuffer
