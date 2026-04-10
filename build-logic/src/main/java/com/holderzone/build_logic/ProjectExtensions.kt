@@ -107,6 +107,10 @@ internal fun Project.resolveLocalMavenRepoDir(): File {
     return rootProject.file(relativePath)
 }
 
+internal fun Project.resolveMavenLocalRepoDir(): File {
+    return File(System.getProperty("user.home"), ".m2/repository")
+}
+
 internal fun Project.resolvePublicationArtifactId(): String {
     val extraArtifactId = extensions.extraProperties
         .takeIf { it.has("artifactId") }

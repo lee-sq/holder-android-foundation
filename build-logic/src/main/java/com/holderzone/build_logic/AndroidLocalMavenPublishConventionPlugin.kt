@@ -7,6 +7,7 @@ import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.create
+import java.io.File
 
 /**
  * Android Library 本地 Maven 发布约定插件。
@@ -41,7 +42,16 @@ private fun Project.configureFoundationLocalMavenPublishing() {
     val publicationName = "release"
     val repositoryName = "foundationLocal"
     val publishTaskName = "publish${publicationName.capitalized()}PublicationTo${repositoryName.capitalized()}Repository"
+    val publishToMavenLocalTaskName = "publish${publicationName.capitalized()}PublicationToMavenLocal"
     val coordinate = "${resolvePublicationGroupId()}:${resolvePublicationArtifactId()}:${version}"
+    val normalizeFoundationLocalTask = registerNormalizePublishedAarTask(
+        taskName = "normalize${publicationName.capitalized()}PublicationFor${repositoryName.capitalized()}Repository",
+        repositoryDir = resolveLocalMavenRepoDir(),
+    )
+    val normalizeMavenLocalTask = registerNormalizePublishedAarTask(
+        taskName = "normalize${publicationName.capitalized()}PublicationForMavenLocal",
+        repositoryDir = resolveMavenLocalRepoDir(),
+    )
 
     extensions.configure<PublishingExtension> {
         repositories {
@@ -68,6 +78,13 @@ private fun Project.configureFoundationLocalMavenPublishing() {
         }
     }
 
+    tasks.matching { it.name == publishTaskName }.configureEach {
+        finalizedBy(normalizeFoundationLocalTask)
+    }
+    tasks.matching { it.name == publishToMavenLocalTaskName }.configureEach {
+        finalizedBy(normalizeMavenLocalTask)
+    }
+
     tasks.register("printPublicationCoordinate") {
         group = "publishing"
         description = "Prints the Maven coordinate and local repository path for this module."
@@ -81,5 +98,31 @@ private fun Project.configureFoundationLocalMavenPublishing() {
         group = "publishing"
         description = "Publishes this module to the root local Maven repository."
         dependsOn(publishTaskName)
+    }
+}
+
+private fun Project.registerNormalizePublishedAarTask(
+    taskName: String,
+    repositoryDir: File,
+) = tasks.register(taskName) {
+    group = "publishing"
+    description = "Creates an unclassified AAR alias next to the published release AAR for JitPack consumers."
+    doLast {
+        val artifactId = resolvePublicationArtifactId()
+        val versionName = version.toString()
+        val publicationDir = repositoryDir
+            .resolve(resolvePublicationGroupId().replace('.', '/'))
+            .resolve(artifactId)
+            .resolve(versionName)
+
+        val releaseAar = publicationDir.resolve("$artifactId-$versionName-release.aar")
+        val plainAar = publicationDir.resolve("$artifactId-$versionName.aar")
+        if (!releaseAar.exists()) {
+            logger.info("skip AAR alias for ${project.path}, source file missing: ${releaseAar.absolutePath}")
+            return@doLast
+        }
+
+        releaseAar.copyTo(target = plainAar, overwrite = true)
+        logger.lifecycle("normalized AAR alias -> ${plainAar.absolutePath}")
     }
 }
