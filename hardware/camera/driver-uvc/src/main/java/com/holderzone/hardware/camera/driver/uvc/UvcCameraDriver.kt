@@ -51,6 +51,10 @@ class UvcCameraDriver(
     private val logger: CameraLogger,
 ) : CameraDriver {
 
+    private companion object {
+        const val TAG = "UvcCameraDriver"
+    }
+
     private val usbManager = appContext.getSystemService(Context.USB_SERVICE) as UsbManager
 
     override val backend: CameraBackend = CameraBackend.UVC
@@ -110,7 +114,9 @@ class UvcCameraDriver(
         selectedDevice = target
         val waiter = CompletableDeferred<Unit>()
         startWaiter = waiter
-        if (!monitor.requestPermission(target)) {
+        val requestFailed = monitor.requestPermission(target)
+        if (requestFailed) {
+            startWaiter = null
             throw CameraException.DeviceUnavailableException("Failed to request USB permission for UVC camera.")
         }
         waiter.await()
@@ -239,12 +245,17 @@ class UvcCameraDriver(
 
     private fun openCamera(controlBlock: USBMonitor.UsbControlBlock) {
         releaseCamera()
-        val camera = UVCCamera().apply {
-            open(controlBlock)
-            configurePreviewSize(this)
-            setFrameCallback({ buffer ->
+        val camera = UVCCamera()
+        try {
+            camera.open(controlBlock)
+            configurePreviewSize(camera)
+            camera.setFrameCallback({ buffer ->
                 handleFrame(buffer, currentConfig?.frameDeliveryConfig ?: FrameDeliveryConfig.DISABLED)
             }, UVCCamera.PIXEL_FORMAT_YUV420SP)
+        } catch (throwable: Throwable) {
+            runCatching { camera.close() }
+            runCatching { camera.destroy() }
+            throw throwable
         }
         openCamera = camera
 
@@ -419,15 +430,12 @@ class UvcCameraDriver(
             runCatching {
                 openCamera(ctrlBlock)
             }.onFailure { throwable ->
-                scope.launch {
-                    startWaiter?.completeExceptionally(
-                        CameraException.DeviceUnavailableException(
-                            "Failed to open the selected UVC device.",
-                            throwable,
-                        )
+                notifyStartFailure(
+                    CameraException.DeviceUnavailableException(
+                        "Failed to open the selected UVC device.",
+                        throwable,
                     )
-                    startWaiter = null
-                }
+                )
             }
         }
 
@@ -455,7 +463,16 @@ class UvcCameraDriver(
             surface = Surface(surfaceTexture)
             pendingControlBlock?.let { controlBlock ->
                 pendingControlBlock = null
-                openCamera(controlBlock)
+                runCatching {
+                    openCamera(controlBlock)
+                }.onFailure { throwable ->
+                    notifyStartFailure(
+                        CameraException.DeviceUnavailableException(
+                            "Failed to open the selected UVC device after the preview surface became available.",
+                            throwable,
+                        )
+                    )
+                }
             }
         }
 
@@ -468,6 +485,15 @@ class UvcCameraDriver(
         }
 
         override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+    }
+
+    private fun notifyStartFailure(exception: CameraException) {
+        logger.error(TAG, exception.message ?: "UVC start failed.", exception)
+        scope.launch {
+            startWaiter?.takeIf { !it.isCompleted }?.completeExceptionally(exception)
+            startWaiter = null
+            eventFlow.emit(CameraEvent.Error(exception))
+        }
     }
 }
 
