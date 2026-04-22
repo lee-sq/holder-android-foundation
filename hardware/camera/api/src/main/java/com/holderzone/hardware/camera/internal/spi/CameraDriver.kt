@@ -7,6 +7,7 @@ import com.holderzone.hardware.camera.CameraEvent
 import com.holderzone.hardware.camera.CameraFrame
 import com.holderzone.hardware.camera.CaptureRequest
 import com.holderzone.hardware.camera.CaptureResult
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
 import kotlinx.coroutines.flow.Flow
@@ -30,6 +31,10 @@ interface CameraDriver : AutoCloseable {
     suspend fun stop()
 
     suspend fun switchLens(facing: LensFacing)
+
+    suspend fun switchToNextCamera()
+
+    suspend fun queryAvailableCameras(): List<AvailableCamera>
 
     suspend fun capture(request: CaptureRequest): CaptureResult
 

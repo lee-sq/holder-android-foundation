@@ -6,8 +6,10 @@ import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.view.Surface
 import android.view.TextureView
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
 import com.holderzone.hardware.camera.CameraCapability
 import com.holderzone.hardware.camera.CameraConfig
@@ -49,9 +51,12 @@ class UvcCameraDriver(
     private val logger: CameraLogger,
 ) : CameraDriver {
 
+    private val usbManager = appContext.getSystemService(Context.USB_SERVICE) as UsbManager
+
     override val backend: CameraBackend = CameraBackend.UVC
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = false,
+        switchCamera = usbManager.deviceList.size > 1,
         stillCapture = false,
         previewSnapshot = true,
         frameStreaming = true,
@@ -121,6 +126,35 @@ class UvcCameraDriver(
         throw CameraException.ConfigurationException("UVC backend does not support lens switching.")
     }
 
+    override suspend fun switchToNextCamera() {
+        ensureOpen()
+        val monitor = ensureUsbMonitor()
+        val cameras = buildAvailableCameras(monitor)
+        if (cameras.size < 2) {
+            throw CameraException.DeviceUnavailableException("No alternate UVC camera is available.")
+        }
+        val currentId = resolveCurrentDeviceId(monitor)
+        val currentIndex = cameras.indexOfFirst { it.id == currentId }
+        val nextIndex = if (currentIndex >= 0) {
+            (currentIndex + 1) % cameras.size
+        } else {
+            0
+        }
+        val nextDevice = cameras[nextIndex]
+        selectedDevice = monitor.deviceList.firstOrNull { device ->
+            device.toAvailableCameraId() == nextDevice.id
+        } ?: throw CameraException.DeviceUnavailableException("The next UVC camera is no longer available.")
+        if (openCamera != null) {
+            stop()
+            start()
+        }
+    }
+
+    override suspend fun queryAvailableCameras(): List<AvailableCamera> {
+        ensureOpen()
+        return buildAvailableCameras(ensureUsbMonitor())
+    }
+
     override suspend fun capture(request: CaptureRequest): CaptureResult {
         ensureOpen()
         if (request is CaptureRequest.RequireStill) {
@@ -179,16 +213,14 @@ class UvcCameraDriver(
             throw CameraException.DeviceUnavailableException("No UVC device matches device_filter.xml.")
         }
 
+        selectedDevice?.let { selected ->
+            candidates.firstOrNull { it.deviceId == selected.deviceId }?.let { return it }
+        }
+
         val selector = currentConfig?.usbDeviceSelector
         return when (selector) {
             null -> {
-                if (candidates.size == 1) {
-                    candidates.first()
-                } else {
-                    throw CameraException.DeviceSelectionRequiredException(
-                        "Multiple UVC devices are connected. Provide UsbDeviceSelector.ByVidPid."
-                    )
-                }
+                candidates.first()
             }
 
             is UsbDeviceSelector.ByVidPid -> candidates.firstOrNull { device ->
@@ -343,6 +375,26 @@ class UvcCameraDriver(
         }
     }
 
+    private fun buildAvailableCameras(monitor: USBMonitor): List<AvailableCamera> {
+        val devices = monitor.deviceList
+        val activeId = resolveCurrentDeviceId(monitor)
+        return devices.mapIndexed { index, device ->
+            AvailableCamera(
+                index = index,
+                id = device.toAvailableCameraId(),
+                displayName = buildDisplayName(device, index),
+                backend = backend,
+                lensFacing = LensFacing.EXTERNAL,
+                isActive = device.toAvailableCameraId() == activeId,
+            )
+        }
+    }
+
+    private fun resolveCurrentDeviceId(monitor: USBMonitor): String? {
+        return selectedDevice?.toAvailableCameraId()
+            ?: runCatching { resolveTargetDevice(monitor).toAvailableCameraId() }.getOrNull()
+    }
+
     private inner class DeviceListener : USBMonitor.OnDeviceConnectListener {
         override fun onAttach(device: UsbDevice) = Unit
 
@@ -429,4 +481,16 @@ private fun nv12ToNv21(source: ByteArray): ByteArray {
         index += 2
     }
     return output
+}
+
+private fun UsbDevice.toAvailableCameraId(): String {
+    return "uvc:${vendorId}:${productId}:${deviceId}"
+}
+
+private fun buildDisplayName(
+    device: UsbDevice,
+    index: Int,
+): String {
+    val productName = device.productName?.takeIf { it.isNotBlank() } ?: "USB Camera"
+    return "$productName ${index + 1}"
 }

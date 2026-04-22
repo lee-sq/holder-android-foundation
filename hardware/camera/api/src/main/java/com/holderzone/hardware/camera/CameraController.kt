@@ -51,6 +51,18 @@ interface CameraController : AutoCloseable {
     suspend fun switchLens(facing: LensFacing)
 
     /**
+     * Switches to the next available camera exposed by the current backend.
+     */
+    suspend fun switchToNextCamera()
+
+    /**
+     * Returns the currently selectable cameras exposed by the active backend.
+     *
+     * The controller must already be bound so the backend is known.
+     */
+    suspend fun queryAvailableCameras(): List<AvailableCamera>
+
+    /**
      * Captures an image according to the requested mode.
      */
     suspend fun capture(request: CaptureRequest): CaptureResult

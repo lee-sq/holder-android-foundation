@@ -5,6 +5,7 @@ package com.holderzone.hardware.camera
  */
 data class CameraCapability(
     val switchLens: Boolean = false,
+    val switchCamera: Boolean = false,
     val stillCapture: Boolean = false,
     val previewSnapshot: Boolean = false,
     val frameStreaming: Boolean = false,

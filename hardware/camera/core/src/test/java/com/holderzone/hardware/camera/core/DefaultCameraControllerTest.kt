@@ -2,6 +2,7 @@ package com.holderzone.hardware.camera.core
 
 import android.content.Context
 import android.view.View
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
 import com.holderzone.hardware.camera.CameraCapability
 import com.holderzone.hardware.camera.CameraConfig
@@ -98,6 +99,44 @@ class DefaultCameraControllerTest {
         advanceUntilIdle()
     }
 
+    @Test
+    fun queryAndSwitchToNextCamera_delegateToDriver() = runTest(dispatcher) {
+        val driver = FakeDriver().apply {
+            availableCameras = listOf(
+                AvailableCamera(
+                    index = 0,
+                    id = "0",
+                    displayName = "Back",
+                    backend = backend,
+                    isActive = true,
+                ),
+                AvailableCamera(
+                    index = 1,
+                    id = "1",
+                    displayName = "Front",
+                    backend = backend,
+                ),
+            )
+        }
+        val context = newContext()
+        val controller = DefaultCameraController(
+            context = context,
+            config = CameraConfig(),
+            driverFactories = listOf(FakeDriverFactory(driver)),
+            logger = NoopCameraLogger,
+        )
+
+        controller.bind(FakePreviewHost(context))
+        val cameras = controller.queryAvailableCameras()
+        controller.switchToNextCamera()
+
+        assertEquals(driver.availableCameras, cameras)
+        assertEquals(1, driver.queryCameraCount)
+        assertEquals(1, driver.switchNextCameraCount)
+        controller.close()
+        advanceUntilIdle()
+    }
+
     private class FakeDriverFactory(
         private val driver: FakeDriver,
     ) : CameraDriverFactory {
@@ -115,6 +154,7 @@ class DefaultCameraControllerTest {
         override val backend: CameraBackend = CameraBackend.CAMERA_X
         override val capabilities: CameraCapability = CameraCapability(
             switchLens = true,
+            switchCamera = true,
             stillCapture = true,
             previewSnapshot = true,
             frameStreaming = true,
@@ -126,7 +166,10 @@ class DefaultCameraControllerTest {
         var startCount = 0
         var stopCount = 0
         var captureCount = 0
+        var switchNextCameraCount = 0
+        var queryCameraCount = 0
         var lastRequest: CaptureRequest? = null
+        var availableCameras: List<AvailableCamera> = emptyList()
 
         override suspend fun bind(host: PreviewHost, config: CameraConfig) {
             bindCount += 1
@@ -143,6 +186,15 @@ class DefaultCameraControllerTest {
         }
 
         override suspend fun switchLens(facing: LensFacing) = Unit
+
+        override suspend fun switchToNextCamera() {
+            switchNextCameraCount += 1
+        }
+
+        override suspend fun queryAvailableCameras(): List<AvailableCamera> {
+            queryCameraCount += 1
+            return availableCameras
+        }
 
         override suspend fun capture(request: CaptureRequest): CaptureResult {
             captureCount += 1

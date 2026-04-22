@@ -157,6 +157,7 @@ private fun CameraSdkSampleScreen() {
         )
         ActionCard(
             canSwitchLens = capabilities.switchLens,
+            canSwitchCamera = capabilities.switchCamera,
             onStart = {
                 scope.launchControllerCommand(
                     controller = controller,
@@ -205,6 +206,17 @@ private fun CameraSdkSampleScreen() {
                     }
                 ) {
                     switchLens(requestedLens)
+                }
+            },
+            onSwitchCamera = {
+                scope.launchControllerCommand(
+                    controller = controller,
+                    onFailure = {
+                        latestEvent =
+                            "Switch camera failed: ${it.message ?: it::class.java.simpleName}"
+                    }
+                ) {
+                    switchToNextCamera()
                 }
             }
         )
@@ -296,6 +308,7 @@ private fun StatusCard(
             )
             StatusLine(label = "State", value = state.toReadableText())
             StatusLine(label = "Switch Lens", value = capabilities.switchLens.toEnabledText())
+            StatusLine(label = "Switch Camera", value = capabilities.switchCamera.toEnabledText())
             StatusLine(label = "Still Capture", value = capabilities.stillCapture.toEnabledText())
             StatusLine(
                 label = "Preview Snapshot",
@@ -333,10 +346,12 @@ private fun StatusLine(
 @Composable
 private fun ActionCard(
     canSwitchLens: Boolean,
+    canSwitchCamera: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onCapture: () -> Unit,
     onSwitchLens: () -> Unit,
+    onSwitchCamera: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -381,6 +396,17 @@ private fun ActionCard(
                 ) {
                     Text("Switch Lens")
                 }
+            }
+            Row(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = onSwitchCamera,
+                    enabled = canSwitchCamera,
+                ) {
+                    Text("Next Camera")
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Spacer(modifier = Modifier.weight(1f))
             }
         }
     }

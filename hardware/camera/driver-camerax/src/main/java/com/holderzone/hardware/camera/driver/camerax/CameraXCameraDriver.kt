@@ -11,7 +11,9 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.ViewTreeObserver
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
@@ -25,6 +27,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.google.common.util.concurrent.ListenableFuture
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
 import com.holderzone.hardware.camera.CameraCapability
 import com.holderzone.hardware.camera.CameraConfig
@@ -55,6 +58,8 @@ import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -71,9 +76,12 @@ class CameraXCameraDriver(
     private val logger: CameraLogger,
 ) : CameraDriver {
 
+    private val cameraManager = appContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
     override val backend: CameraBackend = CameraBackend.CAMERA_X
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = true,
+        switchCamera = cameraManager.cameraIdList.size > 1,
         stillCapture = true,
         previewSnapshot = true,
         frameStreaming = true,
@@ -100,6 +108,8 @@ class CameraXCameraDriver(
     private var camera: Camera? = null
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
+    private var selectedCameraId: String? = null
+    private var activeCameraId: String? = null
     private var lastFrameAtMs: Long = 0L
     private var closed = false
 
@@ -107,6 +117,8 @@ class CameraXCameraDriver(
         ensureOpen()
         currentConfig = config
         currentLensFacing = config.lensFacing
+        selectedCameraId = null
+        activeCameraId = null
         previewHost = host
         previewContainerView = host as? View
         val view = PreviewView(host.previewContext).apply {
@@ -182,15 +194,45 @@ class CameraXCameraDriver(
         imageCapture = null
         imageAnalysis = null
         camera = null
+        activeCameraId = null
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
     override suspend fun switchLens(facing: LensFacing) {
         currentLensFacing = facing
+        selectedCameraId = null
         if (camera != null) {
             stop()
             start()
         }
+    }
+
+    override suspend fun switchToNextCamera() {
+        ensureOpen()
+        val provider = getOrCreateCameraProvider()
+        val cameras = buildAvailableCameras(provider)
+        if (cameras.size < 2) {
+            throw CameraException.DeviceUnavailableException("No alternate CameraX camera is available.")
+        }
+        val currentId = resolveCurrentCameraId(provider)
+        val currentIndex = cameras.indexOfFirst { it.id == currentId }
+        val nextIndex = if (currentIndex >= 0) {
+            (currentIndex + 1) % cameras.size
+        } else {
+            0
+        }
+        val nextCamera = cameras[nextIndex]
+        selectedCameraId = nextCamera.id
+        nextCamera.lensFacing?.let { currentLensFacing = it }
+        if (camera != null) {
+            stop()
+            start()
+        }
+    }
+
+    override suspend fun queryAvailableCameras(): List<AvailableCamera> {
+        ensureOpen()
+        return buildAvailableCameras(getOrCreateCameraProvider())
     }
 
     override suspend fun capture(request: CaptureRequest): CaptureResult {
@@ -332,8 +374,18 @@ class CameraXCameraDriver(
 
     private fun selectCameraSelector(
         provider: ProcessCameraProvider,
-        facing: LensFacing,
     ): CameraSelector {
+        val targetCameraId = selectedCameraId
+        if (targetCameraId != null) {
+            return CameraSelector.Builder()
+                .addCameraFilter { cameraInfos ->
+                    cameraInfos.filter { info ->
+                        cameraIdOf(info) == targetCameraId
+                    }
+                }
+                .build()
+        }
+        val facing = currentLensFacing
         val primary = when (facing) {
             LensFacing.FRONT -> CameraSelector.DEFAULT_FRONT_CAMERA
             LensFacing.BACK -> CameraSelector.DEFAULT_BACK_CAMERA
@@ -383,12 +435,8 @@ class CameraXCameraDriver(
         )
         lifecycleOwner.moveToStarted()
 
-        val provider = cameraProvider ?: withTimeout(8_000L) {
-            ProcessCameraProvider.getInstance(appContext).await()
-        }.also {
-            cameraProvider = it
-        }
-        val selector = selectCameraSelector(provider, currentLensFacing)
+        val provider = getOrCreateCameraProvider()
+        val selector = selectCameraSelector(provider)
         val shouldAnalyze = config.frameDeliveryConfig.enabled
 
         preview = Preview.Builder().build().also {
@@ -419,6 +467,10 @@ class CameraXCameraDriver(
             imageCapture,
             imageAnalysis,
         )
+        activeCameraId = camera?.cameraInfo?.let(::cameraIdOf)
+        if (activeCameraId != null) {
+            selectedCameraId = activeCameraId
+        }
         eventFlow.emit(CameraEvent.PreviewStarted(backend))
     }
 
@@ -505,6 +557,72 @@ class CameraXCameraDriver(
         return isAttachedToWindow && width > 0 && height > 0
     }
 
+    private suspend fun getOrCreateCameraProvider(): ProcessCameraProvider {
+        return cameraProvider ?: withTimeout(8_000L) {
+            ProcessCameraProvider.getInstance(appContext).await()
+        }.also {
+            cameraProvider = it
+        }
+    }
+
+    private fun buildAvailableCameras(provider: ProcessCameraProvider): List<AvailableCamera> {
+        val infosById = provider.availableCameraInfos.associateBy(::cameraIdOf)
+        val orderedIds = buildList {
+            cameraManager.cameraIdList.forEach { cameraId ->
+                if (infosById.containsKey(cameraId)) {
+                    add(cameraId)
+                }
+            }
+            infosById.keys.forEach { cameraId ->
+                if (!contains(cameraId)) {
+                    add(cameraId)
+                }
+            }
+        }
+        val activeId = resolveCurrentCameraId(provider)
+        return orderedIds.mapIndexedNotNull { index, cameraId ->
+            val info = infosById[cameraId] ?: return@mapIndexedNotNull null
+            val lensFacing = lensFacingOf(info)
+            AvailableCamera(
+                index = index,
+                id = cameraId,
+                displayName = buildDisplayName(index, lensFacing),
+                backend = backend,
+                lensFacing = lensFacing,
+                isActive = cameraId == activeId,
+            )
+        }
+    }
+
+    private fun resolveCurrentCameraId(provider: ProcessCameraProvider): String? {
+        return activeCameraId
+            ?: selectedCameraId
+            ?: currentSelectedCameraId(provider)
+            ?: provider.availableCameraInfos.firstOrNull()?.let(::cameraIdOf)
+    }
+
+    private fun currentSelectedCameraId(provider: ProcessCameraProvider): String? {
+        val targetCameraId = selectedCameraId
+        if (targetCameraId != null) {
+            val infos = provider.availableCameraInfos
+            return infos.firstOrNull { info -> cameraIdOf(info) == targetCameraId }?.let(::cameraIdOf)
+        }
+        val selector = selectCameraSelector(provider)
+        return runCatching {
+            selector.filter(provider.availableCameraInfos).firstOrNull()?.let(::cameraIdOf)
+        }.getOrNull()
+    }
+
+    private fun cameraIdOf(cameraInfo: CameraInfo): String {
+        return Camera2CameraInfo.from(cameraInfo).cameraId
+    }
+
+    private fun lensFacingOf(cameraInfo: CameraInfo): LensFacing? {
+        return Camera2CameraInfo.from(cameraInfo)
+            .getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+            .toLensFacing()
+    }
+
     private fun resolveOutputFile(
         requestedFile: File?,
         prefix: String,
@@ -544,6 +662,28 @@ class CameraXCameraDriver(
             )
         }
     }
+}
+
+private fun Int?.toLensFacing(): LensFacing? {
+    return when (this) {
+        CameraCharacteristics.LENS_FACING_FRONT -> LensFacing.FRONT
+        CameraCharacteristics.LENS_FACING_BACK -> LensFacing.BACK
+        CameraCharacteristics.LENS_FACING_EXTERNAL -> LensFacing.EXTERNAL
+        else -> null
+    }
+}
+
+private fun buildDisplayName(
+    index: Int,
+    lensFacing: LensFacing?,
+): String {
+    val label = when (lensFacing) {
+        LensFacing.FRONT -> "Front"
+        LensFacing.BACK -> "Back"
+        LensFacing.EXTERNAL -> "External"
+        null -> "Unknown"
+    }
+    return "CameraX Camera ${index + 1} ($label)"
 }
 
 private class DriverLifecycleOwner : LifecycleOwner {

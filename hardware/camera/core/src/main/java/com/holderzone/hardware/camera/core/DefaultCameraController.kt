@@ -2,6 +2,7 @@ package com.holderzone.hardware.camera.core
 
 import android.content.Context
 import android.os.Looper
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
 import com.holderzone.hardware.camera.CameraBackendPreference
 import com.holderzone.hardware.camera.CameraCapability
@@ -76,6 +77,8 @@ class DefaultCameraController(
                     is ControllerCommand.Start -> command.finishUnit { handleStart() }
                     is ControllerCommand.Stop -> command.finishUnit { handleStop() }
                     is ControllerCommand.SwitchLens -> command.finishUnit { handleSwitchLens(command.facing) }
+                    is ControllerCommand.SwitchToNextCamera -> command.finishUnit { handleSwitchToNextCamera() }
+                    is ControllerCommand.QueryAvailableCameras -> command.finishResult { handleQueryAvailableCameras() }
                     is ControllerCommand.Capture -> command.finishResult { handleCapture(command.request) }
                     is ControllerCommand.Close -> {
                         command.finishUnit { handleCloseInternal() }
@@ -100,6 +103,14 @@ class DefaultCameraController(
 
     override suspend fun switchLens(facing: com.holderzone.hardware.camera.LensFacing) {
         submit<Unit>(ControllerCommand.SwitchLens(facing))
+    }
+
+    override suspend fun switchToNextCamera() {
+        submit<Unit>(ControllerCommand.SwitchToNextCamera())
+    }
+
+    override suspend fun queryAvailableCameras(): List<AvailableCamera> {
+        return submit(ControllerCommand.QueryAvailableCameras())
     }
 
     override suspend fun capture(request: CaptureRequest): CaptureResult {
@@ -176,6 +187,20 @@ class DefaultCameraController(
             is CameraState.Previewing -> CameraState.Previewing(driver.backend, driver.capabilities)
             else -> CameraState.Bound(driver.backend, driver.capabilities)
         }
+    }
+
+    private suspend fun handleSwitchToNextCamera() {
+        val driver = requireDriver()
+        driver.switchToNextCamera()
+        val currentState = mutableState.value
+        mutableState.value = when (currentState) {
+            is CameraState.Previewing -> CameraState.Previewing(driver.backend, driver.capabilities)
+            else -> CameraState.Bound(driver.backend, driver.capabilities)
+        }
+    }
+
+    private suspend fun handleQueryAvailableCameras(): List<AvailableCamera> {
+        return requireDriver().queryAvailableCameras()
     }
 
     private suspend fun handleCapture(request: CaptureRequest): CaptureResult {
@@ -339,6 +364,14 @@ class DefaultCameraController(
             override val completion: CompletableDeferred<Unit> = CompletableDeferred(),
         ) : ControllerCommand
 
+        class SwitchToNextCamera(
+            override val completion: CompletableDeferred<Unit> = CompletableDeferred(),
+        ) : ControllerCommand
+
+        class QueryAvailableCameras(
+            override val completion: CompletableDeferred<List<AvailableCamera>> = CompletableDeferred(),
+        ) : ControllerCommand
+
         class Capture(
             val request: CaptureRequest,
             override val completion: CompletableDeferred<CaptureResult> = CompletableDeferred(),
@@ -357,6 +390,7 @@ class DefaultCameraController(
     }
 
     private suspend fun ControllerCommand.finishUnit(block: suspend () -> Unit) {
+        @Suppress("UNCHECKED_CAST")
         val deferred = completion as CompletableDeferred<Unit>
         runCatching { block() }
             .onSuccess { deferred.complete(Unit) }

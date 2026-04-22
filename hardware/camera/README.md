@@ -89,6 +89,9 @@ val result = controller.capture(
         )
     )
 )
+
+val cameras = controller.queryAvailableCameras()
+controller.switchToNextCamera()
 ```
 
 对应的资源释放边界：
@@ -106,6 +109,10 @@ val result = controller.capture(
   - 优先 still capture，不支持时回退到 snapshot
 - `CaptureRequest.PreviewSnapshot`
   - 明确走预览截帧链路
+- `queryAvailableCameras()`
+  - 返回当前 backend 可选相机列表
+- `switchToNextCamera()`
+  - 在当前 backend 内轮换到下一个相机
 - 三种请求都支持可选 `outputFile`
   - 不传时默认写入 `cacheDir/camera-sdk`
   - 传入后按调用方指定路径落盘，并自动创建父目录

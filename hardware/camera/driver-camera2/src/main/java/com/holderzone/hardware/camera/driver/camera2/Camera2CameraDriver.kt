@@ -23,6 +23,7 @@ import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import androidx.core.content.ContextCompat
+import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
 import com.holderzone.hardware.camera.CameraCapability
 import com.holderzone.hardware.camera.CameraConfig
@@ -71,6 +72,7 @@ class Camera2CameraDriver(
     override val backend: CameraBackend = CameraBackend.CAMERA_2
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = cameraManager.cameraIdList.size > 1,
+        switchCamera = cameraManager.cameraIdList.size > 1,
         stillCapture = false,
         previewSnapshot = true,
         frameStreaming = true,
@@ -88,6 +90,7 @@ class Camera2CameraDriver(
     private var imageReader: ImageReader? = null
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
+    private var selectedCameraId: String? = null
     private var activeCameraId: String? = null
     private var activePreviewSize: Size? = null
     private var latestFrame: CameraFrame? = null
@@ -99,6 +102,7 @@ class Camera2CameraDriver(
         ensureOpen()
         currentConfig = config
         currentLensFacing = config.lensFacing
+        selectedCameraId = null
         previewHost = host
         textureView = TextureView(host.previewContext)
         host.attachPreview(textureView!!)
@@ -113,10 +117,11 @@ class Camera2CameraDriver(
             "Camera2 preview host is not bound."
         )
         val surfaceTexture = awaitSurfaceTexture(texture)
-        val cameraId = selectCameraId(currentLensFacing)
+        val cameraId = selectedCameraId ?: selectCameraId(currentLensFacing)
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val previewSize = choosePreviewSize(characteristics)
 
+        selectedCameraId = cameraId
         activeCameraId = cameraId
         activePreviewSize = previewSize
         val device = openCamera(cameraId)
@@ -170,10 +175,38 @@ class Camera2CameraDriver(
             throw CameraException.ConfigurationException("Camera2 backend does not support lens switching.")
         }
         currentLensFacing = facing
+        selectedCameraId = null
         if (cameraDevice != null) {
             stop()
             start()
         }
+    }
+
+    override suspend fun switchToNextCamera() {
+        ensureOpen()
+        val cameras = buildAvailableCameras()
+        if (cameras.size < 2) {
+            throw CameraException.DeviceUnavailableException("No alternate Camera2 camera is available.")
+        }
+        val currentId = resolveCurrentCameraId(cameras)
+        val currentIndex = cameras.indexOfFirst { it.id == currentId }
+        val nextIndex = if (currentIndex >= 0) {
+            (currentIndex + 1) % cameras.size
+        } else {
+            0
+        }
+        val nextCamera = cameras[nextIndex]
+        selectedCameraId = nextCamera.id
+        nextCamera.lensFacing?.let { currentLensFacing = it }
+        if (cameraDevice != null) {
+            stop()
+            start()
+        }
+    }
+
+    override suspend fun queryAvailableCameras(): List<AvailableCamera> {
+        ensureOpen()
+        return buildAvailableCameras()
     }
 
     override suspend fun capture(request: SdkCaptureRequest): CaptureResult {
@@ -368,6 +401,40 @@ class Camera2CameraDriver(
             ?: throw CameraException.DeviceUnavailableException("No Camera2 camera is available.")
     }
 
+    private fun resolveCurrentCameraId(cameras: List<AvailableCamera>): String? {
+        return activeCameraId
+            ?: selectedCameraId
+            ?: cameras.firstOrNull { it.lensFacing == currentLensFacing }?.id
+            ?: cameras.firstOrNull()?.id
+    }
+
+    private fun buildAvailableCameras(): List<AvailableCamera> {
+        val activeId = resolveCurrentCameraIdFromManager()
+        return cameraManager.cameraIdList.mapIndexed { index, cameraId ->
+            val lensFacing = cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.LENS_FACING)
+                .toLensFacing()
+            AvailableCamera(
+                index = index,
+                id = cameraId,
+                displayName = buildDisplayName(
+                    prefix = "Camera2",
+                    index = index,
+                    lensFacing = lensFacing,
+                ),
+                backend = backend,
+                lensFacing = lensFacing,
+                isActive = cameraId == activeId,
+            )
+        }
+    }
+
+    private fun resolveCurrentCameraIdFromManager(): String? {
+        return activeCameraId
+            ?: selectedCameraId
+            ?: runCatching { selectCameraId(currentLensFacing) }.getOrNull()
+    }
+
     private fun findCameraId(facing: Int): String? {
         return cameraManager.cameraIdList.firstOrNull { id ->
             cameraManager.getCameraCharacteristics(id)
@@ -440,6 +507,29 @@ class Camera2CameraDriver(
             stream.write(output.toByteArray())
         }
     }
+}
+
+private fun Int?.toLensFacing(): LensFacing? {
+    return when (this) {
+        CameraCharacteristics.LENS_FACING_FRONT -> LensFacing.FRONT
+        CameraCharacteristics.LENS_FACING_BACK -> LensFacing.BACK
+        CameraCharacteristics.LENS_FACING_EXTERNAL -> LensFacing.EXTERNAL
+        else -> null
+    }
+}
+
+private fun buildDisplayName(
+    prefix: String,
+    index: Int,
+    lensFacing: LensFacing?,
+): String {
+    val label = when (lensFacing) {
+        LensFacing.FRONT -> "Front"
+        LensFacing.BACK -> "Back"
+        LensFacing.EXTERNAL -> "External"
+        null -> "Unknown"
+    }
+    return "$prefix Camera ${index + 1} ($label)"
 }
 
 private fun Image.toNv21(): ByteArray {
