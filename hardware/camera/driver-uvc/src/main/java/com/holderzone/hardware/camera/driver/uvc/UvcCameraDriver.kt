@@ -74,7 +74,6 @@ class UvcCameraDriver(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val eventFlow = MutableSharedFlow<CameraEvent>(extraBufferCapacity = 16)
     private val frameFlow = MutableSharedFlow<CameraFrame>(extraBufferCapacity = 1)
-    private val deviceFilters = DeviceFilter.getDeviceFilters(appContext, R.xml.device_filter)
 
     private var previewHost: PreviewHost? = null
     private var textureView: TextureView? = null
@@ -206,9 +205,7 @@ class UvcCameraDriver(
 
     private fun ensureUsbMonitor(): USBMonitor {
         usbMonitor?.let { return it }
-        val created = USBMonitor(appContext, DeviceListener()).also {
-            it.setDeviceFilter(deviceFilters)
-        }
+        val created = USBMonitor(appContext, DeviceListener())
         usbMonitor = created
         return created
     }
