@@ -23,6 +23,11 @@ internal data class Camera2PreviewTransformSpec(
     val mappedBufferHeight: Int,
 )
 
+internal data class Camera2SessionOutputs(
+    val previewSize: Camera2Size,
+    val analysisSizesInPreferenceOrder: List<Camera2Size>,
+)
+
 internal fun computeImageTransformSpec(
     sensorOrientation: Int,
     displayRotationDegrees: Int,
@@ -100,6 +105,31 @@ internal fun chooseBestPreviewSize(
     ) ?: rankedCandidates.first()
 }
 
+internal fun buildSessionOutputs(
+    previewCandidates: List<Camera2Size>,
+    analysisCandidates: List<Camera2Size>,
+    viewWidth: Int,
+    viewHeight: Int,
+    sensorOrientation: Int,
+    displayRotationDegrees: Int,
+): Camera2SessionOutputs {
+    val previewSize = chooseBestPreviewSize(
+        candidates = previewCandidates,
+        viewWidth = viewWidth,
+        viewHeight = viewHeight,
+        sensorOrientation = sensorOrientation,
+        displayRotationDegrees = displayRotationDegrees,
+    )
+    val analysisSizesInPreferenceOrder = rankAnalysisSizes(
+        candidates = analysisCandidates,
+        targetAspectRatio = previewSize.width.toDouble() / previewSize.height.toDouble(),
+    )
+    return Camera2SessionOutputs(
+        previewSize = previewSize,
+        analysisSizesInPreferenceOrder = analysisSizesInPreferenceOrder,
+    )
+}
+
 internal fun computeRelativeRotationDegrees(
     sensorOrientation: Int,
     displayRotationDegrees: Int,
@@ -129,6 +159,28 @@ private fun Camera2Size.fitsWithin(
     maxShortEdge: Int,
 ): Boolean {
     return max(width, height) <= maxLongEdge && min(width, height) <= maxShortEdge
+}
+
+private fun rankAnalysisSizes(
+    candidates: List<Camera2Size>,
+    targetAspectRatio: Double,
+    maxLongEdge: Int = 640,
+    maxShortEdge: Int = 480,
+): List<Camera2Size> {
+    if (candidates.isEmpty()) {
+        return emptyList()
+    }
+    val boundedCandidates = candidates.filter { candidate ->
+        candidate.fitsWithin(maxLongEdge = maxLongEdge, maxShortEdge = maxShortEdge)
+    }
+    val rankedCandidates = boundedCandidates.ifEmpty { candidates }
+    return rankedCandidates
+        .sortedWith(
+            compareBy<Camera2Size> {
+                abs((it.width.toDouble() / it.height.toDouble()) - targetAspectRatio)
+            }.thenBy { it.width.toLong() * it.height.toLong() }
+        )
+        .distinct()
 }
 
 private fun normalizeRightAngleDegrees(value: Int): Int {

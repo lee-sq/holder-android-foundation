@@ -115,6 +115,35 @@ class Camera2PreviewMathTest {
     }
 
     @Test
+    fun buildSessionOutputs_prefersSmallerAnalysisSizeWithMatchingAspect() {
+        val outputs = buildSessionOutputs(
+            previewCandidates = listOf(
+                Camera2Size(width = 1920, height = 1080),
+                Camera2Size(width = 1280, height = 720),
+            ),
+            analysisCandidates = listOf(
+                Camera2Size(width = 1280, height = 720),
+                Camera2Size(width = 960, height = 540),
+                Camera2Size(width = 640, height = 360),
+                Camera2Size(width = 640, height = 480),
+            ),
+            viewWidth = 1080,
+            viewHeight = 1920,
+            sensorOrientation = 90,
+            displayRotationDegrees = 0,
+        )
+
+        assertEquals(Camera2Size(width = 1280, height = 720), outputs.previewSize)
+        assertEquals(
+            listOf(
+                Camera2Size(width = 640, height = 360),
+                Camera2Size(width = 640, height = 480),
+            ),
+            outputs.analysisSizesInPreferenceOrder.take(2)
+        )
+    }
+
+    @Test
     fun previewTransformSpec_swapsMappedBufferForPortraitPreview() {
         val spec = computePreviewTransformSpec(
             previewWidth = 1280,

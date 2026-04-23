@@ -56,6 +56,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -100,11 +103,14 @@ class Camera2CameraDriver(
     private var selectedCameraId: String? = null
     private var activeCameraId: String? = null
     private var activePreviewSize: Size? = null
+    private var activeAnalysisSize: Size? = null
     private var activeSensorOrientation: Int? = null
     private var latestFrame: CameraFrame? = null
     private var captureWaiter: CompletableDeferred<CameraFrame>? = null
     private var lastFrameAtMs: Long = 0L
     private var isDisplayListenerRegistered = false
+    @Volatile
+    private var acceptsIncomingFrames = false
     private var closed = false
     private val previewLayoutChangeListener = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
         if ((right - left) != (oldRight - oldLeft) || (bottom - top) != (oldBottom - oldTop)) {
@@ -150,11 +156,15 @@ class Camera2CameraDriver(
         val cameraId = selectedCameraId ?: selectCameraId(currentLensFacing)
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        val previewSize = choosePreviewSize(
+        val sessionOutputs = chooseSessionOutputs(
             characteristics = characteristics,
             viewWidth = texture.width,
             viewHeight = texture.height,
             surfaceRotationDegrees = displayRotationDegreesOf(texture),
+        )
+        val previewSize = Size(
+            sessionOutputs.previewSize.width,
+            sessionOutputs.previewSize.height,
         )
 
         selectedCameraId = cameraId
@@ -168,47 +178,37 @@ class Camera2CameraDriver(
         registerDisplayListenerIfNeeded()
         applyPreviewTransformIfReady()
         val previewSurface = Surface(surfaceTexture)
-        val reader = ImageReader.newInstance(
-            previewSize.width,
-            previewSize.height,
-            ImageFormat.YUV_420_888,
-            2,
-        )
-        imageReader = reader
         val frameConfig = currentConfig?.frameDeliveryConfig ?: FrameDeliveryConfig.DISABLED
-        reader.setOnImageAvailableListener(
-            { source ->
-                val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
-                handleImage(image, frameConfig)
-            },
-            backgroundHandler,
-        )
-
-        val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(previewSurface)
-            addTarget(reader.surface)
-            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        }
-
-        captureSession = createCaptureSession(device, listOf(previewSurface, reader.surface)).also { session ->
-            session.setRepeatingRequest(requestBuilder.build(), null, backgroundHandler)
+        try {
+            acceptsIncomingFrames = true
+            val sessionResources = createSessionResources(
+                device = device,
+                previewSurface = previewSurface,
+                analysisSizes = sessionOutputs.analysisSizesInPreferenceOrder,
+                frameConfig = frameConfig,
+            )
+            imageReader = sessionResources.imageReader
+            activeAnalysisSize = sessionResources.analysisSize
+            captureSession = sessionResources.captureSession
+        } catch (throwable: Throwable) {
+            acceptsIncomingFrames = false
+            unregisterDisplayListenerIfNeeded()
+            closeActiveCameraResources()
+            throw throwable
         }
         eventFlow.emit(CameraEvent.PreviewStarted(backend))
     }
 
     override suspend fun stop() {
         unregisterDisplayListenerIfNeeded()
-        captureSession?.close()
-        captureSession = null
-        cameraDevice?.close()
-        cameraDevice = null
-        imageReader?.close()
-        imageReader = null
+        acceptsIncomingFrames = false
+        closeActiveCameraResources()
         activeCameraId = null
         activePreviewSize = null
+        activeAnalysisSize = null
         activeSensorOrientation = null
         latestFrame = null
+        takeCaptureWaiter()?.cancel()
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
@@ -284,9 +284,8 @@ class Camera2CameraDriver(
         closed = true
 
         runCatching {
-            captureSession?.close()
-            cameraDevice?.close()
-            imageReader?.close()
+            acceptsIncomingFrames = false
+            closeActiveCameraResourcesBlocking()
         }.onFailure {
             logger.error("Camera2CameraDriver", "Failed to close camera resources.", it)
         }
@@ -302,8 +301,7 @@ class Camera2CameraDriver(
         previewHost = null
         textureView = null
         latestFrame = null
-        captureWaiter?.cancel()
-        captureWaiter = null
+        takeCaptureWaiter()?.cancel()
         scope.cancel()
     }
 
@@ -311,6 +309,15 @@ class Camera2CameraDriver(
         image: Image,
         frameConfig: FrameDeliveryConfig,
     ) {
+        if (!acceptsIncomingFrames) {
+            failPendingCapture(
+                CameraException.CaptureFailureException(
+                    "Camera2 snapshot capture was aborted because the driver is stopping."
+                )
+            )
+            image.close()
+            return
+        }
         try {
             val imageTransform = currentImageTransformSpec()
             val frame = CameraFrame(
@@ -321,8 +328,7 @@ class Camera2CameraDriver(
                 timestampNs = image.timestamp,
             )
             latestFrame = frame
-            captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
-            captureWaiter = null
+            completePendingCapture(frame)
 
             val now = System.currentTimeMillis()
             if (frameConfig.enabled && now - lastFrameAtMs >= frameConfig.minIntervalMillis) {
@@ -342,6 +348,12 @@ class Camera2CameraDriver(
                     )
                 )
             }
+            failPendingCapture(
+                CameraException.CaptureFailureException(
+                    "Camera2 frame pipeline failed.",
+                    throwable,
+                )
+            )
         } finally {
             image.close()
         }
@@ -349,7 +361,7 @@ class Camera2CameraDriver(
 
     private suspend fun awaitSnapshotFrame(): CameraFrame {
         val waiter = CompletableDeferred<CameraFrame>()
-        captureWaiter = waiter
+        setCaptureWaiter(waiter)
         return waiter.await()
     }
 
@@ -496,6 +508,73 @@ class Camera2CameraDriver(
         }
     }
 
+    private suspend fun createSessionResources(
+        device: CameraDevice,
+        previewSurface: Surface,
+        analysisSizes: List<Camera2Size>,
+        frameConfig: FrameDeliveryConfig,
+    ): Camera2SessionResources {
+        var lastFailure: Throwable? = null
+        for (analysisSize in analysisSizes) {
+            val reader = createImageReader(analysisSize, frameConfig)
+            val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(previewSurface)
+                addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            }
+            var session: CameraCaptureSession? = null
+            try {
+                session = createCaptureSession(device, listOf(previewSurface, reader.surface))
+                session.setRepeatingRequest(requestBuilder.build(), null, backgroundHandler)
+                logger.debug(
+                    "Camera2CameraDriver",
+                    "Started Camera2 session with preview=${activePreviewSize?.width}x${activePreviewSize?.height} " +
+                        "analysis=${analysisSize.width}x${analysisSize.height}"
+                )
+                return Camera2SessionResources(
+                    captureSession = session,
+                    imageReader = reader,
+                    analysisSize = Size(analysisSize.width, analysisSize.height),
+                )
+            } catch (throwable: Throwable) {
+                lastFailure = throwable
+                runCatching { session?.close() }
+                reader.setOnImageAvailableListener(null, null)
+                reader.safeClose()
+                logger.warn(
+                    "Camera2CameraDriver",
+                    "Camera2 session failed for analysis=${analysisSize.width}x${analysisSize.height}; trying next fallback."
+                )
+            }
+        }
+
+        throw CameraException.PreviewBindingException(
+            "Camera2 capture session configuration failed for all supported analysis sizes.",
+            lastFailure,
+        )
+    }
+
+    private fun createImageReader(
+        analysisSize: Camera2Size,
+        frameConfig: FrameDeliveryConfig,
+    ): ImageReader {
+        return ImageReader.newInstance(
+            analysisSize.width,
+            analysisSize.height,
+            ImageFormat.YUV_420_888,
+            2,
+        ).apply {
+            setOnImageAvailableListener(
+                { source ->
+                    val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    handleImage(image, frameConfig)
+                },
+                backgroundHandler,
+            )
+        }
+    }
+
     private fun selectCameraId(facing: LensFacing): String {
         val desired = when (facing) {
             LensFacing.FRONT -> CameraCharacteristics.LENS_FACING_FRONT
@@ -554,12 +633,12 @@ class Camera2CameraDriver(
         }
     }
 
-    private fun choosePreviewSize(
+    private fun chooseSessionOutputs(
         characteristics: CameraCharacteristics,
         viewWidth: Int,
         viewHeight: Int,
         surfaceRotationDegrees: Int,
-    ): Size {
+    ): Camera2SessionOutputs {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw CameraException.PreviewBindingException("Camera2 stream configuration is unavailable.")
         val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
@@ -570,20 +649,19 @@ class Camera2CameraDriver(
             throw CameraException.PreviewBindingException("Camera2 preview output sizes are unavailable.")
         }
         val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
-            ?.map { size -> size.width to size.height }
-            ?.toSet()
+            ?.map { size -> Camera2Size(width = size.width, height = size.height) }
             .orEmpty()
-        val compatibleSizes = textureSizes.filter { candidate ->
-            (candidate.width to candidate.height) in yuvSizes
-        }.ifEmpty { textureSizes }
-        val selected = chooseBestPreviewSize(
-            candidates = compatibleSizes,
+        if (yuvSizes.isEmpty()) {
+            throw CameraException.PreviewBindingException("Camera2 analysis output sizes are unavailable.")
+        }
+        return buildSessionOutputs(
+            previewCandidates = textureSizes,
+            analysisCandidates = yuvSizes,
             viewWidth = viewWidth,
             viewHeight = viewHeight,
             sensorOrientation = sensorOrientation,
             displayRotationDegrees = surfaceRotationDegrees,
         )
-        return Size(selected.width, selected.height)
     }
 
     private fun ensurePermission() {
@@ -599,6 +677,42 @@ class Camera2CameraDriver(
     private fun ensureOpen() {
         if (closed) {
             throw CameraException.ClosedException()
+        }
+    }
+
+    private suspend fun closeActiveCameraResources() {
+        val session = captureSession
+        val device = cameraDevice
+        val reader = imageReader
+        captureSession = null
+        cameraDevice = null
+        imageReader = null
+        if (session == null && device == null && reader == null) {
+            return
+        }
+        runOnBackgroundThreadAndWait {
+            reader?.setOnImageAvailableListener(null, null)
+            session?.close()
+            device?.close()
+            reader?.safeClose()
+        }
+    }
+
+    private fun closeActiveCameraResourcesBlocking() {
+        val session = captureSession
+        val device = cameraDevice
+        val reader = imageReader
+        captureSession = null
+        cameraDevice = null
+        imageReader = null
+        if (session == null && device == null && reader == null) {
+            return
+        }
+        runOnBackgroundThreadAndWaitBlocking {
+            reader?.setOnImageAvailableListener(null, null)
+            session?.close()
+            device?.close()
+            reader?.safeClose()
         }
     }
 
@@ -717,6 +831,87 @@ class Camera2CameraDriver(
             }
         }
     }
+
+    private suspend fun runOnBackgroundThreadAndWait(
+        block: () -> Unit,
+    ) {
+        val handler = backgroundHandler
+        if (handler == null || Looper.myLooper() == handler.looper) {
+            block()
+            return
+        }
+        suspendCancellableCoroutine<Unit> { continuation ->
+            if (!handler.post {
+                    runCatching(block)
+                        .onSuccess {
+                            if (continuation.isActive) {
+                                continuation.resume(Unit)
+                            }
+                        }
+                        .onFailure {
+                            if (continuation.isActive) {
+                                continuation.resumeWithException(it)
+                            }
+                        }
+                }
+            ) {
+                runCatching(block)
+                    .onSuccess { continuation.resume(Unit) }
+                    .onFailure { continuation.resumeWithException(it) }
+            }
+        }
+    }
+
+    private fun runOnBackgroundThreadAndWaitBlocking(
+        block: () -> Unit,
+    ) {
+        val handler = backgroundHandler
+        if (handler == null || Looper.myLooper() == handler.looper) {
+            block()
+            return
+        }
+        val latch = CountDownLatch(1)
+        var failure: Throwable? = null
+        if (!handler.post {
+                runCatching(block)
+                    .onFailure { failure = it }
+                latch.countDown()
+            }
+        ) {
+            block()
+            return
+        }
+        latch.await(1500, TimeUnit.MILLISECONDS)
+        failure?.let { throw it }
+    }
+
+    private fun setCaptureWaiter(
+        waiter: CompletableDeferred<CameraFrame>,
+    ) {
+        synchronized(this) {
+            captureWaiter = waiter
+        }
+    }
+
+    private fun takeCaptureWaiter(): CompletableDeferred<CameraFrame>? {
+        return synchronized(this) {
+            val waiter = captureWaiter
+            captureWaiter = null
+            waiter
+        }
+    }
+
+    private fun completePendingCapture(frame: CameraFrame) {
+        takeCaptureWaiter()
+            ?.takeIf { !it.isCompleted }
+            ?.complete(frame)
+    }
+
+    private fun failPendingCapture(throwable: Throwable) {
+        takeCaptureWaiter()
+            ?.takeIf { !it.isCompleted }
+            ?.completeExceptionally(throwable)
+    }
 }
 
 private fun Int?.toLensFacing(): LensFacing? {
@@ -773,6 +968,10 @@ private fun Bitmap.applyImageTransform(
     return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
 }
 
+private fun ImageReader.safeClose() {
+    runCatching { close() }
+}
+
 private fun Image.toNv21(): ByteArray {
     val width = width
     val height = height
@@ -781,37 +980,70 @@ private fun Image.toNv21(): ByteArray {
     val uPlane = planes[1]
     val vPlane = planes[2]
 
-    val yBytes = ByteArray(yPlane.buffer.remaining())
-    yPlane.buffer.get(yBytes)
-    var offset = 0
-    if (yPlane.pixelStride == 1 && yPlane.rowStride == width) {
-        System.arraycopy(yBytes, 0, output, 0, yBytes.size)
-        offset = yBytes.size
-    } else {
-        for (row in 0 until height) {
-            var index = row * yPlane.rowStride
-            repeat(width) {
-                output[offset++] = yBytes[index]
-                index += yPlane.pixelStride
-            }
-        }
-    }
-
-    val uBytes = ByteArray(uPlane.buffer.remaining())
-    val vBytes = ByteArray(vPlane.buffer.remaining())
-    uPlane.buffer.get(uBytes)
-    vPlane.buffer.get(vBytes)
-    val chromaHeight = height / 2
+    copyPlaneToOutput(
+        buffer = yPlane.buffer.duplicate().apply { rewind() },
+        rowStride = yPlane.rowStride,
+        pixelStride = yPlane.pixelStride,
+        rowCount = height,
+        columnCount = width,
+        output = output,
+        outputOffset = 0,
+        outputPixelStride = 1,
+    )
     val chromaWidth = width / 2
-    for (row in 0 until chromaHeight) {
-        var uIndex = row * uPlane.rowStride
-        var vIndex = row * vPlane.rowStride
-        repeat(chromaWidth) {
-            output[offset++] = vBytes[vIndex]
-            output[offset++] = uBytes[uIndex]
-            uIndex += uPlane.pixelStride
-            vIndex += vPlane.pixelStride
-        }
-    }
+    val chromaHeight = height / 2
+    copyPlaneToOutput(
+        buffer = vPlane.buffer.duplicate().apply { rewind() },
+        rowStride = vPlane.rowStride,
+        pixelStride = vPlane.pixelStride,
+        rowCount = chromaHeight,
+        columnCount = chromaWidth,
+        output = output,
+        outputOffset = width * height,
+        outputPixelStride = 2,
+    )
+    copyPlaneToOutput(
+        buffer = uPlane.buffer.duplicate().apply { rewind() },
+        rowStride = uPlane.rowStride,
+        pixelStride = uPlane.pixelStride,
+        rowCount = chromaHeight,
+        columnCount = chromaWidth,
+        output = output,
+        outputOffset = width * height + 1,
+        outputPixelStride = 2,
+    )
     return output
 }
+
+private fun copyPlaneToOutput(
+    buffer: ByteBuffer,
+    rowStride: Int,
+    pixelStride: Int,
+    rowCount: Int,
+    columnCount: Int,
+    output: ByteArray,
+    outputOffset: Int,
+    outputPixelStride: Int,
+) {
+    if (rowCount == 0 || columnCount == 0 || buffer.limit() == 0) {
+        return
+    }
+    var outputIndex = outputOffset
+    for (row in 0 until rowCount) {
+        val rowStart = minOf(buffer.limit() - 1, row * rowStride)
+        for (column in 0 until columnCount) {
+            val bufferIndex = rowStart + column * pixelStride
+            if (bufferIndex >= buffer.limit()) {
+                return
+            }
+            output[outputIndex] = buffer.get(bufferIndex)
+            outputIndex += outputPixelStride
+        }
+    }
+}
+
+private data class Camera2SessionResources(
+    val captureSession: CameraCaptureSession,
+    val imageReader: ImageReader,
+    val analysisSize: Size,
+)
