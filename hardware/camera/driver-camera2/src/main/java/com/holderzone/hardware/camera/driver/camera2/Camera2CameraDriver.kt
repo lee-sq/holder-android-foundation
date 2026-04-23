@@ -4,24 +4,29 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.params.StreamConfigurationMap
+import android.hardware.display.DisplayManager
 import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
+import android.view.ViewTreeObserver
 import androidx.core.content.ContextCompat
 import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
@@ -65,9 +70,11 @@ class Camera2CameraDriver(
 ) : CameraDriver {
 
     private val cameraManager = appContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val displayManager = appContext.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     private val eventFlow = MutableSharedFlow<CameraEvent>(extraBufferCapacity = 16)
     private val frameFlow = MutableSharedFlow<CameraFrame>(extraBufferCapacity = 1)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override val backend: CameraBackend = CameraBackend.CAMERA_2
     override val capabilities: CameraCapability = CameraCapability(
@@ -93,10 +100,29 @@ class Camera2CameraDriver(
     private var selectedCameraId: String? = null
     private var activeCameraId: String? = null
     private var activePreviewSize: Size? = null
+    private var activeSensorOrientation: Int? = null
     private var latestFrame: CameraFrame? = null
     private var captureWaiter: CompletableDeferred<CameraFrame>? = null
     private var lastFrameAtMs: Long = 0L
+    private var isDisplayListenerRegistered = false
     private var closed = false
+    private val previewLayoutChangeListener = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+        if ((right - left) != (oldRight - oldLeft) || (bottom - top) != (oldBottom - oldTop)) {
+            applyPreviewTransformIfReady()
+        }
+    }
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+
+        override fun onDisplayRemoved(displayId: Int) = Unit
+
+        override fun onDisplayChanged(displayId: Int) {
+            val previewDisplay = textureView?.display ?: return
+            if (previewDisplay.displayId == displayId) {
+                applyPreviewTransformIfReady()
+            }
+        }
+    }
 
     override suspend fun bind(host: PreviewHost, config: CameraConfig) {
         ensureOpen()
@@ -104,7 +130,10 @@ class Camera2CameraDriver(
         currentLensFacing = config.lensFacing
         selectedCameraId = null
         previewHost = host
-        textureView = TextureView(host.previewContext)
+        textureView?.removeOnLayoutChangeListener(previewLayoutChangeListener)
+        textureView = TextureView(host.previewContext).apply {
+            addOnLayoutChangeListener(previewLayoutChangeListener)
+        }
         host.attachPreview(textureView!!)
     }
 
@@ -116,18 +145,28 @@ class Camera2CameraDriver(
         val texture = textureView ?: throw CameraException.PreviewBindingException(
             "Camera2 preview host is not bound."
         )
+        awaitPreviewHostReady(texture)
         val surfaceTexture = awaitSurfaceTexture(texture)
         val cameraId = selectedCameraId ?: selectCameraId(currentLensFacing)
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val previewSize = choosePreviewSize(characteristics)
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val previewSize = choosePreviewSize(
+            characteristics = characteristics,
+            viewWidth = texture.width,
+            viewHeight = texture.height,
+            surfaceRotationDegrees = displayRotationDegreesOf(texture),
+        )
 
         selectedCameraId = cameraId
         activeCameraId = cameraId
         activePreviewSize = previewSize
+        activeSensorOrientation = sensorOrientation
         val device = openCamera(cameraId)
         cameraDevice = device
 
         surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
+        registerDisplayListenerIfNeeded()
+        applyPreviewTransformIfReady()
         val previewSurface = Surface(surfaceTexture)
         val reader = ImageReader.newInstance(
             previewSize.width,
@@ -159,6 +198,7 @@ class Camera2CameraDriver(
     }
 
     override suspend fun stop() {
+        unregisterDisplayListenerIfNeeded()
         captureSession?.close()
         captureSession = null
         cameraDevice?.close()
@@ -167,6 +207,8 @@ class Camera2CameraDriver(
         imageReader = null
         activeCameraId = null
         activePreviewSize = null
+        activeSensorOrientation = null
+        latestFrame = null
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
@@ -252,9 +294,11 @@ class Camera2CameraDriver(
         backgroundThread?.quitSafely()
         backgroundThread = null
         backgroundHandler = null
+        unregisterDisplayListenerIfNeeded()
         previewHost?.let { host ->
             textureView?.let(host::detachPreview)
         }
+        textureView?.removeOnLayoutChangeListener(previewLayoutChangeListener)
         previewHost = null
         textureView = null
         latestFrame = null
@@ -268,11 +312,13 @@ class Camera2CameraDriver(
         frameConfig: FrameDeliveryConfig,
     ) {
         try {
+            val imageTransform = currentImageTransformSpec()
             val frame = CameraFrame(
                 nv21 = image.toNv21(),
                 width = image.width,
                 height = image.height,
-                rotationDegrees = 0,
+                rotationDegrees = imageTransform.rotationDegrees,
+                timestampNs = image.timestamp,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
@@ -307,6 +353,19 @@ class Camera2CameraDriver(
         return waiter.await()
     }
 
+    private fun currentImageTransformSpec(): Camera2ImageTransformSpec {
+        val sensorOrientation = activeSensorOrientation
+            ?: return Camera2ImageTransformSpec(
+                rotationDegrees = 0,
+                mirrorHorizontally = currentLensFacing == LensFacing.FRONT,
+            )
+        return computeImageTransformSpec(
+            sensorOrientation = sensorOrientation,
+            displayRotationDegrees = textureView?.let(::displayRotationDegreesOf) ?: 0,
+            lensFacing = currentLensFacing,
+        )
+    }
+
     private fun ensureBackgroundThread() {
         if (backgroundThread != null) {
             return
@@ -330,6 +389,59 @@ class Camera2CameraDriver(
 
                 override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
             }
+        }
+    }
+
+    private suspend fun awaitPreviewHostReady(textureView: TextureView) {
+        if (textureView.isReadyForCameraStart()) {
+            return
+        }
+        suspendCancellableCoroutine<Unit> { continuation ->
+            lateinit var attachListener: View.OnAttachStateChangeListener
+            lateinit var layoutListener: View.OnLayoutChangeListener
+            lateinit var preDrawListener: ViewTreeObserver.OnPreDrawListener
+
+            fun cleanup() {
+                textureView.removeOnAttachStateChangeListener(attachListener)
+                textureView.removeOnLayoutChangeListener(layoutListener)
+                if (textureView.viewTreeObserver.isAlive) {
+                    textureView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+                }
+            }
+
+            fun resumeIfReady() {
+                if (!continuation.isActive) {
+                    return
+                }
+                if (textureView.isReadyForCameraStart()) {
+                    cleanup()
+                    continuation.resume(Unit)
+                }
+            }
+
+            attachListener = object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    resumeIfReady()
+                }
+
+                override fun onViewDetachedFromWindow(v: View) = Unit
+            }
+            layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                resumeIfReady()
+            }
+            preDrawListener = ViewTreeObserver.OnPreDrawListener {
+                resumeIfReady()
+                true
+            }
+
+            textureView.addOnAttachStateChangeListener(attachListener)
+            textureView.addOnLayoutChangeListener(layoutListener)
+            if (textureView.viewTreeObserver.isAlive) {
+                textureView.viewTreeObserver.addOnPreDrawListener(preDrawListener)
+            }
+
+            textureView.post { resumeIfReady() }
+            continuation.invokeOnCancellation { cleanup() }
         }
     }
 
@@ -442,17 +554,36 @@ class Camera2CameraDriver(
         }
     }
 
-    private fun choosePreviewSize(characteristics: CameraCharacteristics): Size {
+    private fun choosePreviewSize(
+        characteristics: CameraCharacteristics,
+        viewWidth: Int,
+        viewHeight: Int,
+        surfaceRotationDegrees: Int,
+    ): Size {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw CameraException.PreviewBindingException("Camera2 stream configuration is unavailable.")
-        return chooseSize(map.getOutputSizes(SurfaceTexture::class.java))
-    }
-
-    private fun chooseSize(candidates: Array<Size>): Size {
-        return candidates
-            .sortedByDescending { it.width * it.height }
-            .firstOrNull { it.width <= 1280 && it.height <= 720 }
-            ?: candidates.first()
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val textureSizes = map.getOutputSizes(SurfaceTexture::class.java)
+            ?.map { size -> Camera2Size(width = size.width, height = size.height) }
+            .orEmpty()
+        if (textureSizes.isEmpty()) {
+            throw CameraException.PreviewBindingException("Camera2 preview output sizes are unavailable.")
+        }
+        val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
+            ?.map { size -> size.width to size.height }
+            ?.toSet()
+            .orEmpty()
+        val compatibleSizes = textureSizes.filter { candidate ->
+            (candidate.width to candidate.height) in yuvSizes
+        }.ifEmpty { textureSizes }
+        val selected = chooseBestPreviewSize(
+            candidates = compatibleSizes,
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            sensorOrientation = sensorOrientation,
+            displayRotationDegrees = surfaceRotationDegrees,
+        )
+        return Size(selected.width, selected.height)
     }
 
     private fun ensurePermission() {
@@ -502,9 +633,88 @@ class Camera2CameraDriver(
         if (!yuv.compressToJpeg(Rect(0, 0, frame.width, frame.height), 95, output)) {
             throw CameraException.CaptureFailureException("Failed to encode Camera2 snapshot from NV21.")
         }
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { stream ->
-            stream.write(output.toByteArray())
+        val bytes = output.toByteArray()
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: throw CameraException.CaptureFailureException("Failed to decode Camera2 snapshot from NV21.")
+        val transformed = source.applyImageTransform(
+            rotationDegrees = frame.rotationDegrees,
+            mirrorHorizontally = currentLensFacing == LensFacing.FRONT,
+        )
+        try {
+            saveBitmap(transformed, file)
+        } finally {
+            if (transformed !== source) {
+                source.recycle()
+            }
+            transformed.recycle()
+        }
+    }
+
+    private fun registerDisplayListenerIfNeeded() {
+        if (isDisplayListenerRegistered) {
+            return
+        }
+        displayManager.registerDisplayListener(displayListener, mainHandler)
+        isDisplayListenerRegistered = true
+    }
+
+    private fun unregisterDisplayListenerIfNeeded() {
+        if (!isDisplayListenerRegistered) {
+            return
+        }
+        displayManager.unregisterDisplayListener(displayListener)
+        isDisplayListenerRegistered = false
+    }
+
+    private fun applyPreviewTransformIfReady() {
+        val texture = textureView ?: return
+        val previewSize = activePreviewSize ?: return
+        val sensorOrientation = activeSensorOrientation ?: return
+        if (!texture.isReadyForCameraStart()) {
+            return
+        }
+        val transformSpec = computePreviewTransformSpec(
+            previewWidth = previewSize.width,
+            previewHeight = previewSize.height,
+            sensorOrientation = sensorOrientation,
+            displayRotationDegrees = displayRotationDegreesOf(texture),
+            lensFacing = currentLensFacing,
+        )
+        texture.setTransform(
+            buildPreviewTransformMatrix(
+                viewWidth = texture.width,
+                viewHeight = texture.height,
+                transformSpec = transformSpec,
+            )
+        )
+    }
+
+    private fun buildPreviewTransformMatrix(
+        viewWidth: Int,
+        viewHeight: Int,
+        transformSpec: Camera2PreviewTransformSpec,
+    ): Matrix {
+        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
+        val bufferRect = RectF(
+            0f,
+            0f,
+            transformSpec.mappedBufferWidth.toFloat(),
+            transformSpec.mappedBufferHeight.toFloat(),
+        )
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+        return Matrix().apply {
+            setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = maxOf(
+                viewWidth.toFloat() / transformSpec.mappedBufferWidth.toFloat(),
+                viewHeight.toFloat() / transformSpec.mappedBufferHeight.toFloat(),
+            )
+            postScale(scale, scale, centerX, centerY)
+            postRotate(-transformSpec.displayRotationDegrees.toFloat(), centerX, centerY)
+            if (transformSpec.mirrorHorizontally) {
+                postScale(-1f, 1f, centerX, centerY)
+            }
         }
     }
 }
@@ -530,6 +740,37 @@ private fun buildDisplayName(
         null -> "Unknown"
     }
     return "$prefix Camera ${index + 1} ($label)"
+}
+
+private fun TextureView.isReadyForCameraStart(): Boolean {
+    return isAttachedToWindow && width > 0 && height > 0
+}
+
+private fun displayRotationDegreesOf(textureView: TextureView): Int {
+    return when (textureView.display?.rotation ?: Surface.ROTATION_0) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+}
+
+private fun Bitmap.applyImageTransform(
+    rotationDegrees: Int,
+    mirrorHorizontally: Boolean,
+): Bitmap {
+    if (rotationDegrees == 0 && !mirrorHorizontally) {
+        return this
+    }
+    val matrix = Matrix().apply {
+        if (rotationDegrees != 0) {
+            postRotate(rotationDegrees.toFloat())
+        }
+        if (mirrorHorizontally) {
+            postScale(-1f, 1f)
+        }
+    }
+    return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
 }
 
 private fun Image.toNv21(): ByteArray {
