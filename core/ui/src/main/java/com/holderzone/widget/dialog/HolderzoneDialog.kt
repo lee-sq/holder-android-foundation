@@ -10,7 +10,10 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Animatable
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
@@ -131,11 +134,12 @@ private fun DialogFullScreen(
             }
             Box(
                 modifier = Modifier.fillMaxSize(),
-                contentAlignment = when(properties.direction){
+                contentAlignment = when (properties.direction) {
                     DirectionState.TOP -> Alignment.TopCenter
                     DirectionState.LEFT -> Alignment.CenterStart
                     DirectionState.RIGHT -> Alignment.CenterEnd
-                    else -> Alignment.BottomCenter
+                    DirectionState.BOTTOM -> Alignment.BottomCenter
+                    DirectionState.CENTER -> Alignment.Center
                 }
             ) {
                 Spacer(
@@ -154,13 +158,15 @@ private fun DialogFullScreen(
                         DirectionState.TOP -> slideInVertically(initialOffsetY = { -it })
                         DirectionState.LEFT -> slideInHorizontally(initialOffsetX = { -it })
                         DirectionState.RIGHT -> slideInHorizontally(initialOffsetX = { it })
-                        else -> slideInVertically(initialOffsetY = { it })
+                        DirectionState.BOTTOM -> slideInVertically(initialOffsetY = { it })
+                        DirectionState.CENTER -> fadeIn() + scaleIn(initialScale = 0.9f)
                     },
                     exit = when (properties.direction) {
                         DirectionState.TOP -> fadeOut() + slideOutVertically(targetOffsetY = { -it })
                         DirectionState.LEFT -> fadeOut() + slideOutHorizontally(targetOffsetX = { -it })
                         DirectionState.RIGHT -> fadeOut() + slideOutHorizontally(targetOffsetX = { it })
-                        else -> fadeOut() + slideOutVertically(targetOffsetY = { it })
+                        DirectionState.BOTTOM -> fadeOut() + slideOutVertically(targetOffsetY = { it })
+                        DirectionState.CENTER -> fadeOut() + scaleOut(targetScale = 0.9f)
                     }
                 ) {
                     content()
@@ -250,7 +256,8 @@ enum class DirectionState {
     TOP,
     LEFT,
     RIGHT,
-    BOTTOM
+    BOTTOM,
+    CENTER
 }
 
 private fun Modifier.clickOutSideModifier(
