@@ -220,7 +220,7 @@ internal class JwScaleDriver private constructor(
     private inner class JwWeightCallback : WeightDeviceCallBack {
         override fun onRealWeightInformationCallBack(deviceWeightInfo: DeviceWeightInfo) {
             val reading = WeightReading(
-                grams = kilogramsToGrams(deviceWeightInfo.real_weight.toDouble()),
+                grams = kilogramsToGrams(deviceWeightInfo.real_weight),
                 tareGrams = kilogramsToGrams(deviceWeightInfo.peel_value.toDouble()),
                 stable = deviceWeightInfo.holod_state == 1,
                 netMode = deviceWeightInfo.peel_value.toDouble() > 0,

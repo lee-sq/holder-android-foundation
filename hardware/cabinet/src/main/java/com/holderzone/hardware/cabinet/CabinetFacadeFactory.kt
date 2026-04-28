@@ -25,8 +25,8 @@ object CabinetFacadeFactory {
             context = context.applicationContext,
             driverFactories = listOf(
                 StarDriverFactory(),
-                JwSdkDriverFactory(),
                 JwSerialDriverFactory(),
+                JwSdkDriverFactory()
             ),
         )
     }

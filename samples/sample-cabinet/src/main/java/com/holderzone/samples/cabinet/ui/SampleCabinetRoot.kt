@@ -303,12 +303,7 @@ private fun DialogAnimationPreview(
                 }
             )
     ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = shape,
-            tonalElevation = 6.dp,
-        ) {
-            Column(
+        Column(
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -338,7 +333,6 @@ private fun DialogAnimationPreview(
                     }
                 }
             }
-        }
     }
 }
 

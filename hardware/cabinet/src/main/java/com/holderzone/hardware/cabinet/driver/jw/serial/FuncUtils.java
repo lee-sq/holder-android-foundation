@@ -3,7 +3,7 @@
 // (powered by FernFlower decompiler)
 //
 
-package com.holderzone.hardware.cabinet.util;
+package com.holderzone.hardware.cabinet.driver.jw.serial;
 
 import com.bjw.utils.FuncUtil;
 

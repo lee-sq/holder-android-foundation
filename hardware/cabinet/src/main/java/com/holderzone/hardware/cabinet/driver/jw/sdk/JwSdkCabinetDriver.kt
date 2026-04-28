@@ -197,7 +197,7 @@ internal class JwSdkCabinetDriver private constructor(
     }
 
     override suspend fun queryDoorState(door: Int): CabinetResult<DoorStateSnapshot> {
-        if (door <= 0 || door > doorCount) {
+        if (door !in 1..doorCount) {
             return CabinetResult.Err(
                 CabinetError.Configuration("door must be within 1..$doorCount for vendor $vendor.")
             )

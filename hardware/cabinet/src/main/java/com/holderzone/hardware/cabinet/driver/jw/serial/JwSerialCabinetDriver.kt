@@ -24,7 +24,6 @@ import com.holderzone.hardware.cabinet.print.CommonTSPLPrintProvide
 import com.holderzone.hardware.cabinet.print.PrintResult
 import com.tongdeliu.jwbaselib.utils.CRCCheck
 import com.tongdeliu.jwbaselib.utils.CRCCheckUtils
-import com.tongdeliu.jwbaselib.utils.FuncUtils
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
