@@ -5,8 +5,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -17,6 +19,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -24,6 +29,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.holderzone.hardware.cabinet.CabinetVendor
+import com.holderzone.widget.dialog.AnyPopDialogProperties
+import com.holderzone.widget.dialog.DirectionState
+import com.holderzone.widget.dialog.HolderzoneDialog
 import com.holderzone.widget.toast.CommonToastHost
 
 /**
@@ -107,6 +115,9 @@ private fun HomeScreen(
     onPrintLabel: () -> Unit,
     onStopCabinet: () -> Unit,
 ) {
+    var dialogDirection by remember { mutableStateOf<DirectionState?>(null) }
+    var isActiveClose by remember { mutableStateOf(false) }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -164,6 +175,44 @@ private fun HomeScreen(
                     ActionItem("Print Label", onPrintLabel),
                     ActionItem("Stop SDK", onStopCabinet),
                 )
+            )
+        }
+        item {
+            ActionCard(
+                title = "Dialog 动画测试",
+                actions = listOf(
+                    ActionItem("Bottom Dialog") {
+                        isActiveClose = false
+                        dialogDirection = DirectionState.BOTTOM
+                    },
+                    ActionItem("Center Dialog") {
+                        isActiveClose = false
+                        dialogDirection = DirectionState.CENTER
+                    },
+                )
+            )
+        }
+    }
+
+    val currentDialogDirection = dialogDirection
+    if (currentDialogDirection != null) {
+        HolderzoneDialog(
+            isActiveClose = isActiveClose,
+            properties = AnyPopDialogProperties(
+                direction = currentDialogDirection,
+                dismissOnBackPress = true,
+                dismissOnClickOutside = true,
+                backgroundDimEnabled = true,
+                durationMillis = 250,
+            ),
+            onDismiss = {
+                isActiveClose = false
+                dialogDirection = null
+            }
+        ) {
+            DialogAnimationPreview(
+                direction = currentDialogDirection,
+                onAnimatedClose = { isActiveClose = true }
             )
         }
     }
@@ -224,6 +273,68 @@ private fun ActionCard(
                 actions.forEach { action ->
                     Button(onClick = action.onClick) {
                         Text(action.label)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialogAnimationPreview(
+    direction: DirectionState,
+    onAnimatedClose: () -> Unit,
+) {
+    val isBottomSheet = direction == DirectionState.BOTTOM
+    val shape = if (isBottomSheet) {
+        RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+    } else {
+        RoundedCornerShape(28.dp)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (isBottomSheet) {
+                    Modifier.navigationBarsPadding()
+                } else {
+                    Modifier.padding(horizontal = 20.dp)
+                }
+            )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = shape,
+            tonalElevation = 6.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = if (isBottomSheet) {
+                        "Bottom HolderzoneDialog"
+                    } else {
+                        "Center HolderzoneDialog"
+                    },
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Text(
+                    text = "点击黑色遮罩、系统返回键，或者下方的“主动关闭”按钮，观察遮罩是否只做短暂的渐隐渐显。",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "当前方向: ${direction.name}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(onClick = onAnimatedClose) {
+                        Text("主动关闭")
                     }
                 }
             }

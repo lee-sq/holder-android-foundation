@@ -55,6 +55,8 @@ private tailrec fun Context.getActivityWindow(): Window? = when (this) {
 }
 
 private const val DefaultDurationMillis: Int = 250
+private const val DefaultBackgroundFadeDurationMillis: Int = 120
+private const val DefaultBackgroundDimAlpha: Float = 0.45F
 
 @Composable
 private fun DialogFullScreen(
@@ -97,16 +99,30 @@ private fun DialogFullScreen(
             val systemUiController = rememberSystemUiController()
 
             val animColor = remember { Animatable(Color.Transparent) }
+            val backgroundFadeDurationMillis =
+                minOf(properties.durationMillis, DefaultBackgroundFadeDurationMillis)
             LaunchedEffect(isAnimateLayout) {
-                if(properties.backgroundDimEnabled) {
+                if (properties.backgroundDimEnabled) {
                     animColor.animateTo(
-                        if (isAnimateLayout) Color.Black.copy(alpha = 0.45F) else Color.Transparent,
-                        animationSpec = tween(properties.durationMillis)
+                        if (isAnimateLayout) {
+                            Color.Black.copy(alpha = DefaultBackgroundDimAlpha)
+                        } else {
+                            Color.Transparent
+                        },
+                        animationSpec = tween(backgroundFadeDurationMillis)
                     )
                 } else {
-                    delay(properties.durationMillis.toLong())
+                    animColor.snapTo(Color.Transparent)
                 }
                 if (!isAnimateLayout) {
+                    val dismissDelayMillis = if (properties.backgroundDimEnabled) {
+                        (properties.durationMillis - backgroundFadeDurationMillis).coerceAtLeast(0)
+                    } else {
+                        properties.durationMillis
+                    }
+                    if (dismissDelayMillis > 0) {
+                        delay(dismissDelayMillis.toLong())
+                    }
                     onDismissRequest.invoke()
                 }
             }
